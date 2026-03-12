@@ -1,0 +1,30 @@
+[project]
+name = "debisim2"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12, <3.13"
+dependencies = [
+    "pip==26.0.1",
+    "pyyaml==6.0.3",
+    "torch",
+    "torchvision",
+    "tabulate",
+    "skimage",
+    "scipy",
+    "astra-toolbox @ file:C:///Users/MBasa/PycharmProjects/debisim2/astra_toolbox-2.2.0-cp312-cp312-win_amd64.whl",
+    "pygpufit @ file:C:///Users/MBasa/PycharmProjects/debisim2/pyGpufit-1.2.0-py2.py3-none-win_amd64.whl"
+]
+
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" }
+]
+torchvision = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'win32'" }
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
