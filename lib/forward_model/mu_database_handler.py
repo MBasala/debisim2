@@ -192,11 +192,12 @@ materials_list              - list of all saved materials including elements,
 """
 
 import sys, os
+import builtins
 
 from lib.misc.fdlib import *
 from lib.misc.util import *
 from lib.misc.ctlib import *
-from numpy import *
+import numpy as np
 import subprocess as sub
 
 
@@ -314,8 +315,9 @@ class MuDatabaseHandler(object):
                       self.elements_list[18:31] + self.elements_list[36:50] + \
                       self.elements_list[54:83] + self.elements_list[87:]
 
-        self.periodic_table = recfromcsv(os.path.join(MU_DIR,
-                                                      'periodic_table.csv'))
+        self.periodic_table = genfromtxt(fname=os.path.join(MU_DIR,
+                                                      'periodic_table.csv'),
+                                         delimiter=',', skip_header=1)
 
         self.molar_masses = {x[2]: x[3] for x in self.periodic_table}
 
@@ -701,7 +703,7 @@ class MuDatabaseHandler(object):
 
             if cmat in self.element.keys():
 
-                s_len = min(spec.size, self.element[cmat]['mu'].size)
+                s_len = builtins.min(spec.size, self.element[cmat]['mu'].size)
 
                 self.element[cmat]['lac%s'%k] =  -log(sum(spec[:s_len]*
                                                     exp(-self.element[cmat]['mu'][:s_len]
@@ -712,7 +714,7 @@ class MuDatabaseHandler(object):
 
             elif cmat in self.compound.keys():
 
-                s_len = min(spec.size, self.compound[cmat]['mu'].size)
+                s_len = builtins.min(spec.size, self.compound[cmat]['mu'].size)
 
                 self.compound[cmat]['lac%s'%k] = -log(sum(spec[:s_len]*
                                                     exp(-self.compound[cmat]['mu'][:s_len]
@@ -722,7 +724,7 @@ class MuDatabaseHandler(object):
                 - self.compound['water']['lac%s'%k])/self.compound['water']['lac%s'%k]*1000
 
             elif cmat in self.target.keys():
-                s_len = min(spec.size, self.target[cmat]['mu'].size)
+                s_len = builtins.min(spec.size, self.target[cmat]['mu'].size)
 
                 self.target[cmat]['lac%s'%k] = -log(sum(spec[:s_len]*
                                                     exp(-self.target[cmat]['mu'][:s_len]

@@ -275,10 +275,10 @@ class ShapeListHandle(object):
                          3:'neoprene'}
 
         bag_bg_img = zeros((gantry_dia, gantry_dia))
-        gantry_x, gantry_y = circle(gantry_dia//2,
-                                    gantry_dia//2,
-                                    gantry_dia//2*0.9,
-                                    (gantry_dia, gantry_dia))
+        gantry_x, gantry_y = disk(center=(gantry_dia//2,
+                                    gantry_dia//2),
+                                    radius=gantry_dia//2*0.9,
+                                    shape=(gantry_dia, gantry_dia))
         gantry_cavity = bag_bg_img.copy()
         gantry_cavity[gantry_x, gantry_y] = 1
 

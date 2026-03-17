@@ -1,4 +1,3 @@
-from numpy import *
 import os, warnings
 
 warnings.filterwarnings('ignore')
@@ -39,6 +38,17 @@ RAMLAK_FILTER_FILE          = os.path.join(SCANNER_DIR, 'ramlak.mat')
 SPECTRUM_FILE_NAME          = os.path.join(SCANNER_DIR, '%s_%ikV.txt')
 CUSTOM_SHAPES_DIR           = os.path.join(EXAMPLE_DIR, 'custom_shapes')
 PHANTOM_SL_DIR              = os.path.join(EXAMPLE_DIR, 'phantom_shape_lists')
+
+# STL object pool directories
+STL_POOLS_DIR               = os.path.join(EXAMPLE_DIR, 'stl_pools')
+STL_BAGS_DIR                = os.path.join(STL_POOLS_DIR, 'bags')
+STL_THREATS_DIR             = os.path.join(STL_POOLS_DIR, 'threats')
+STL_FIREARMS_DIR            = os.path.join(STL_THREATS_DIR, 'firearms')
+STL_SHARP_DIR               = os.path.join(STL_THREATS_DIR, 'sharp_objects')
+STL_EXPLOSIVES_DIR          = os.path.join(STL_THREATS_DIR, 'explosives')
+STL_OTHER_THREATS_DIR       = os.path.join(STL_THREATS_DIR, 'other')
+STL_FILLERS_DIR             = os.path.join(STL_POOLS_DIR, 'fillers')
+STL_LIQUID_CONTAINERS_DIR   = os.path.join(STL_POOLS_DIR, 'liquid_containers')
 
 # pipeline module directories
 BAG_GEN_DIR                 = os.path.join(LIB_DIR, 'bag_generator')

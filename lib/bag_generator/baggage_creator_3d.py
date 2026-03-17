@@ -20,6 +20,9 @@ __status__    = "Prototype"
 # -----------------------------------------------------------------------------
 
 import random as rdm
+import builtins
+
+import scipy
 import skimage.transform as sktr
 import scipy.ndimage as sptx
 
@@ -29,6 +32,7 @@ from tabulate import tabulate
 
 from lib.forward_model.mu_database_handler import *
 from lib.bag_generator.shape_list_handle import *
+from lib.misc.stl_loader import load_mesh_file, orient_mask_upright
 
 warnings.filterwarnings('ignore')
 
@@ -346,7 +350,7 @@ class Object3D(object):
 
         e_pix = ellipsoid(axes[0], axes[1], axes[2])
 
-        max_axes = max(e_pix.shape)
+        max_axes = builtins.max(e_pix.shape)
         mask = zeros((max_axes, max_axes, max_axes))
         mask_dim = e_pix.shape[0], e_pix.shape[1], e_pix.shape[2]
         start_pt = max_axes - e_pix.shape[0], \
@@ -453,9 +457,9 @@ class Object3D(object):
         cyl_circle = np.zeros((2*radius+dist,
                                2*radius+int(dist)))
 
-        rr, cc = circle(cyl_circle.shape[0]//2,
-                        cyl_circle.shape[0]//2,
-                        radius,
+        rr, cc = disk(center=(cyl_circle.shape[0]//2,
+                        cyl_circle.shape[0]//2),
+                        radius=radius,
                         shape=cyl_circle.shape)
 
         cyl_circle[rr, cc] = 1
@@ -570,7 +574,10 @@ class Object3D(object):
                     circ_rad = radius2
 
                 cyl_circle = np.zeros((2 * radius2 + 1, 2 * radius2 + 1))
-                rr, cc = circle(radius2 + 1, radius2 + 1, circ_rad, shape=cyl_circle.shape)
+                rr, cc = disk(
+                        center=(radius2 + 1, radius2 + 1),
+                        radius=circ_rad,
+                        shape=cyl_circle.shape)
                 cyl_circle[rr, cc] = 1
                 ref_image[:, :, i] = cyl_circle
         else:
@@ -600,7 +607,7 @@ class Object3D(object):
                 if circ_rad > radius1:
                     circ_rad = radius1
                 cyl_circle = np.zeros((2 * radius1 + 1, 2 * radius1 + 1))
-                rr, cc = circle(radius1 + 1, radius1 + 1, circ_rad, shape=cyl_circle.shape)
+                rr, cc = disk(center=(radius1 + 1, radius1 + 1), radius=circ_rad, shape=cyl_circle.shape)
                 cyl_circle[rr, cc] = 1
                 ref_image[:, :, i] = cyl_circle
 
@@ -772,7 +779,7 @@ class Object3D(object):
         mask = sptx.rotate(mask, theta[1], axes=(2,1), order=0)
         mask = sptx.rotate(mask, theta[2], axes=(0,2), order=0)
 
-        mask = sktr.rescale(mask.astype(np.float), scale, preserve_range=True)
+        mask = sktr.rescale(mask.astype(float), scale, preserve_range=True)
 
         mask[mask < 0.5] = 0
         mask[mask > 1]   = 1
@@ -952,7 +959,7 @@ class BaggageImage3D(object):
                                         gantry_dia,
                                         template=None)
         
-        self.size = max(gantry_dia//2, self.img_vol[2])
+        self.size = builtins.max(gantry_dia//2, self.img_vol[2])
         v_bag = np.zeros((self.size, self.size, self.size))
 
         # add boundary to image -----------------------------------------------
@@ -1007,6 +1014,49 @@ class BaggageImage3D(object):
         self.logger.info('\n')
     # -------------------------------------------------------------------------
 
+    def replace_boundary_with_stl(self, stl_path, voxel_resolution=64):
+        """
+        -----------------------------------------------------------------------
+        Replace the default cubic bag boundary with a voxelized STL bag shape.
+
+        :param stl_path:            path to the STL file for the bag shape
+        :param voxel_resolution:    target voxel resolution for STL loading
+        :return:
+        -----------------------------------------------------------------------
+        """
+        self.logger.info(f"Replacing bag boundary with STL: {stl_path}")
+
+        mask = load_mesh_file(stl_path, target_voxel_size=voxel_resolution)
+        mask = mask.astype(bool)
+
+        # Scale mask to fit within the boundary region (2*bb_h per axis)
+        target_shape = (2 * self.bb_h, 2 * self.bb_h, 2 * self.bb_h)
+        mask = sktr.resize(mask, target_shape, order=0,
+                           preserve_range=True).astype(bool)
+
+        # Create hollow shell by eroding the solid mask
+        eroded = sptx.binary_erosion(mask, iterations=self.bb_t)
+        shell = mask & ~eroded
+
+        # Clear old boundary from ws_bag
+        ctr = self.size // 2
+        h = self.bb_h
+        t = self.bb_t
+        self.ws_bag[ctr - h - t:ctr + h + t,
+                    ctr - h - t:ctr + h + t,
+                    ctr - h - t:ctr + h + t] = 0
+
+        # Place new shell boundary in ws_bag
+        new_bound = np.zeros((self.size, self.size, self.size), dtype=bool)
+        new_bound[ctr - h:ctr + h, ctr - h:ctr + h, ctr - h:ctr + h] = shell
+        self.ws_bag += self.bb_label * new_bound.astype(self.ws_bag.dtype)
+
+        # Update boundary mask for overlap checking
+        self.boundary = new_bound
+
+        self.logger.info("Bag boundary replaced successfully.")
+    # -------------------------------------------------------------------------
+
     def create_random_object_list(self,
                                   material_list,
                                   liquid_list,
@@ -1022,7 +1072,8 @@ class BaggageImage3D(object):
                                   custom_objects=None,
                                   custom_obj_prob=0.0,
                                   metal_dict={'metal_amt': None, 'metal_size': None},
-                                  target_dict={'num_range': None, 'is_liquid': False}
+                                  target_dict={'num_range': None, 'is_liquid': False},
+                                  stl_pool_config=None
                                   ):
 
         """
@@ -1053,6 +1104,9 @@ class BaggageImage3D(object):
                                     'metal_size':   min and max dimensions for metals
         :param target_dict:         'num_range': min and max number of targets allowed.
                                     'is_liquid': whether target is liquid
+        :param stl_pool_config:     optional dict with categorized STL object
+                                    pools (bags, threats, fillers). See config
+                                    files for schema.
 
         :return:                    list of 3D objects
         -----------------------------------------------------------------------
@@ -1091,7 +1145,7 @@ class BaggageImage3D(object):
                             if not isscalar(number_of_objects) \
                             else number_of_objects
 
-        custom_obj_prob = 0.0 if custom_objects is None else custom_obj_prob
+        custom_obj_prob = 0.0 if custom_objects is None or len(custom_objects) == 0 else custom_obj_prob
 
         orig_metal_amt = metal_dict['metal_amt']
 
@@ -1101,6 +1155,151 @@ class BaggageImage3D(object):
         self.start_label = self.bb_label + 1
         self.end_label = self.start_label + number_of_objects
         self.lqd_count = self.end_label
+
+        # =================================================================
+        # STL Pool Generation Phases
+        # =================================================================
+        if stl_pool_config is not None:
+            voxel_res = stl_pool_config.get('voxel_resolution', 64)
+            label_idx = self.start_label
+
+            # Phase 0: Replace bag boundary with STL bag shape
+            bags_cfg = stl_pool_config.get('bags', {})
+            bag_pool = bags_cfg.get('pool', [])
+            if len(bag_pool) > 0:
+                bag_stl = np.random.choice(bag_pool)
+                self.replace_boundary_with_stl(bag_stl,
+                                               voxel_resolution=voxel_res)
+
+            # Helper to create an Object3D from a pool file
+            def _create_pool_object(pool_file, mat, label_id,
+                                    lqd_flag=False, lqd_param=None):
+                c_geom = dict()
+                c_geom['center'] = array([0, 0, 0])
+                c_geom['dim'] = np.random.rand(3) * diff_dim + min_dim
+                c_geom['scale'] = np.random.rand() * 1.0 + 0.5
+                c_geom['src'] = pool_file
+                mask = load_mesh_file(pool_file,
+                                      target_voxel_size=voxel_res)
+
+                if lqd_flag:
+                    # For liquid containers: orient upright so the
+                    # tallest axis aligns with axis 0 (gravity).
+                    # Only allow yaw rotation (axis 1 rot) to keep
+                    # the waterline parallel to the ground plane.
+                    mask = orient_mask_upright(mask)
+                    c_geom['rot'] = array([0.0,
+                                           np.random.rand() * 360,
+                                           0.0])
+                else:
+                    c_geom['rot'] = np.random.rand(3) * 90
+
+                c_geom['mask'] = mask
+
+                obj_dict = self.slh.create_sim_object(
+                    geom=c_geom, shape='M',
+                    obj_material=mat, label=label_id,
+                    lqd_flag=lqd_flag, lqd_param=lqd_param)
+
+                c_pose = array([
+                    int(pose_range[0] + max_dim),
+                    int(np.random.rand() * pose_diff + pose_range[0]),
+                    int(np.random.rand() * pose_diff + pose_range[0])
+                ])
+
+                return Object3D(obj_dict=obj_dict, obj_pose=c_pose)
+
+            # Phase 1: Threat objects
+            threats_cfg = stl_pool_config.get('threats', {})
+            for cat_name, cat_cfg in threats_cfg.items():
+                cat_pool = cat_cfg.get('pool', [])
+                if len(cat_pool) == 0:
+                    continue
+                count_range = cat_cfg.get('count_range', (0, 0))
+                count = np.random.randint(count_range[0], count_range[1] + 1)
+                cat_materials = cat_cfg.get('materials', material_list)
+                cat_pdf = cat_cfg.get('material_pdf', None)
+
+                for _ in range(count):
+                    pool_file = np.random.choice(cat_pool)
+                    mat = np.random.choice(cat_materials, p=cat_pdf)
+                    obj = _create_pool_object(pool_file, mat, label_idx)
+                    obj_list.append(obj)
+                    label_idx += 1
+                    target_counter += 1
+                    self.logger.info(
+                        f"STL threat ({cat_name}): {pool_file}, "
+                        f"material={mat}")
+
+            # Phase 2: Filler objects
+            fillers_cfg = stl_pool_config.get('fillers', {})
+            filler_pool = fillers_cfg.get('pool', [])
+            if len(filler_pool) > 0:
+                count_range = fillers_cfg.get('count_range', (0, 0))
+                count = np.random.randint(count_range[0],
+                                          count_range[1] + 1)
+                filler_materials = fillers_cfg.get('materials', material_list)
+                filler_pdf = fillers_cfg.get('material_pdf', material_pdf)
+
+                for _ in range(count):
+                    pool_file = np.random.choice(filler_pool)
+                    mat = np.random.choice(filler_materials, p=filler_pdf)
+                    obj = _create_pool_object(pool_file, mat, label_idx)
+                    obj_list.append(obj)
+                    label_idx += 1
+                    self.logger.info(
+                        f"STL filler: {pool_file}, material={mat}")
+
+            # Phase 3: Liquid container objects (bottles filled with liquid)
+            lqd_containers_cfg = stl_pool_config.get('liquid_containers', {})
+            lqd_pool = lqd_containers_cfg.get('pool', [])
+            if len(lqd_pool) > 0:
+                count_range = lqd_containers_cfg.get('count_range', (0, 0))
+                count = np.random.randint(count_range[0],
+                                          count_range[1] + 1)
+                cntr_materials = lqd_containers_cfg.get(
+                    'container_materials', ['pyrex', 'polyethylene'])
+                cntr_pdf = lqd_containers_cfg.get(
+                    'container_material_pdf', None)
+                lqd_materials = lqd_containers_cfg.get(
+                    'liquid_materials', ['water'])
+                lqd_mat_pdf = lqd_containers_cfg.get(
+                    'liquid_material_pdf', None)
+
+                for _ in range(count):
+                    pool_file = np.random.choice(lqd_pool)
+                    cntr_mat = np.random.choice(cntr_materials, p=cntr_pdf)
+                    lqd_mat = np.random.choice(lqd_materials, p=lqd_mat_pdf)
+
+                    lqd_param = dict(
+                        lqd_level=random.random() * 0.5 + 0.4,
+                        lqd_material=lqd_mat,
+                        cntr_thickness=random.choice(sheet_dim_list),
+                        lqd_label=self.lqd_count
+                    )
+                    self.lqd_count += 1
+
+                    obj = _create_pool_object(
+                        pool_file, cntr_mat, label_idx,
+                        lqd_flag=True, lqd_param=lqd_param)
+                    obj_list.append(obj)
+                    label_idx += 1
+                    self.logger.info(
+                        f"STL liquid container: {pool_file}, "
+                        f"container={cntr_mat}, liquid={lqd_mat}")
+
+            # Adjust remaining primitives count
+            stl_obj_count = len(obj_list)
+            remaining = number_of_objects - stl_obj_count
+            self.start_label = label_idx
+            self.end_label = self.start_label + builtins.max(0, remaining)
+            self.lqd_count = self.end_label
+
+            self.logger.info(
+                f"STL pool: {stl_obj_count} objects created, "
+                f"{builtins.max(0, remaining)} primitives remaining")
+
+        # =================================================================
 
         # iterate for the number of objects specified
         for i in range(self.start_label, self.end_label):
@@ -1173,7 +1372,7 @@ class BaggageImage3D(object):
                 c_geom['rot']    = np.random.rand(3)*90
                 c_geom['scale']  = np.random.rand()*1.0 + 0.5
                 c_geom['src']    = np.random.choice(custom_objects)
-                c_geom['mask']   = read_fits_data(c_geom['src'])
+                c_geom['mask']   = load_mesh_file(c_geom['src'])
             # =================================================================
 
             # if liquids are to be spawned randomly choose the object to be a
@@ -1438,7 +1637,7 @@ class BaggageImage3D(object):
                     c_geom['rot']    = np.random.rand(3)*90
                     c_geom['scale']  = np.random.rand()*1.0 + 0.5
                     c_geom['src']    = np.random.choice(custom_objects)
-                    c_geom['mask']   = read_fits_data(c_geom['src'])
+                    c_geom['mask']   = load_mesh_file(c_geom['src'])
 
                 obj_dict, curr_obj = change_object_material('target',
                                                             target_dict['is_liquid'])
@@ -1942,8 +2141,20 @@ class BaggageImage3D(object):
         a3 = -(a0*a[0] + a1*a[1] + a2*a[2])
 
         poly_grid = polygon(pt_triad[:,1], pt_triad[:,2])
-        z_val = -(1/a0)*(a1*poly_grid[0] + a2*poly_grid[1] + a3)
-        z_val = z_val.astype(int)
+
+        if a0 == 0:
+            # Degenerate normal — fall back to the mean row of the triad
+            z_val = np.full(poly_grid[0].shape,
+                            int(np.mean(pt_triad[:, 0])))
+        else:
+            z_val = -(1/a0)*(a1*poly_grid[0] + a2*poly_grid[1] + a3)
+            z_val = z_val.astype(int)
+
+        # Clamp all indices to valid ws_bag range
+        z_val = np.clip(z_val, 0, self.ws_bag.shape[0] - 1)
+        poly_grid = (np.clip(poly_grid[0], 0, self.ws_bag.shape[1] - 1),
+                     np.clip(poly_grid[1], 0, self.ws_bag.shape[2] - 1))
+
         triplane = z_val, poly_grid[0], poly_grid[1]
 
         return triplane
@@ -1958,7 +2169,7 @@ class BaggageImage3D(object):
         :return:
         -----------------------------------------------------------------------
         """
-        bag_obj.data =  binary_dilation(bag_obj.data.astype(bool),
+        bag_obj.data =  scipy.ndimage.binary_dilation(bag_obj.data.astype(bool),
                                                ball(bag_obj.axes[0]))
         OVERLAP_FLAG, overlap_vol = self.get_overlap(bag_obj)
         bag_obj.data[np.where(overlap_vol)] = 0

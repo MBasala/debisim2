@@ -95,9 +95,9 @@ sf_list                     - the input shape list
 """
 
 
-from skimage.draw import circle
+from skimage.draw import disk
 import scipy.ndimage as sptx
-
+from typing import Optional
 from lib.forward_model.mu_database_handler import *
 import torch
 
@@ -107,7 +107,7 @@ class ImageVoxelizer3D(object):
     def __init__(self,
                  sf_list,
                  imgshape=(664, 664, 450),
-                 mu_dbase=None
+                 mu_dbase: Optional[MuDatabaseHandler] = None
                  ):
         """
         ------------------------------------------------------------------------
@@ -282,7 +282,7 @@ class ImageVoxelizer3D(object):
         ref_image =   zeros((2*radius+1, 2*radius+1, 2*int(dist)))
 
         cyl_circle =   zeros((2*radius+1, 2*radius+1))
-        rr, cc = circle(radius + 1, radius + 1, radius)
+        rr, cc = disk(radius + 1, radius + 1, radius=radius)
         cyl_circle[rr, cc] = 1
 
         for i in range(int(dist),2*int(dist)):
@@ -348,7 +348,7 @@ class ImageVoxelizer3D(object):
                     circ_rad = radius2
 
                 cyl_circle =   zeros((2 * radius2 + 1, 2 * radius2 + 1))
-                rr, cc = circle(radius2 + 1, radius2 + 1, circ_rad)
+                rr, cc = disk(radius2 + 1, radius2 + 1, radius=circ_rad)
                 cyl_circle[rr, cc] = 1
                 ref_image[:, :, i] = cyl_circle
         else:
@@ -365,7 +365,7 @@ class ImageVoxelizer3D(object):
                 if circ_rad >radius1:
                     circ_rad = radius1
                 cyl_circle =   zeros((2 * radius1 + 1, 2 * radius1 + 1))
-                rr, cc = circle(radius1 + 1, radius1 + 1, circ_rad)
+                rr, cc = disk(radius1 + 1, radius1 + 1, radius=circ_rad)
                 cyl_circle[rr, cc] = 1
                 ref_image[:, :, i] = cyl_circle
 

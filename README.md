@@ -29,10 +29,10 @@ To know more about the mechanism behind the simulator, read our supporting resea
 
 #### Requirements
 
-- Python3  (>v3.7.x)
-- CUDA Toolkit (>=v9.2)
-- For GPU Support: PyTorch (>=v1.0.1), pyGpufit (>=v1.1.0)
-- The ASTRA toolbox (>=1.9.0)
+- Python3  (>v3.11.x)
+- CUDA Toolkit (>=v12.0)
+- For GPU Support: PyTorch , pyGpufit 
+- The ASTRA toolbox
 - The FreeCT_wFBP reconstruction library
 
 #### Setup and Installation

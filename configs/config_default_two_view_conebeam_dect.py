@@ -21,6 +21,7 @@ __status__    = "Prototype"
 # -----------------------------------------------------------------------------
 
 from lib.__init__ import *
+from lib.misc.stl_loader import discover_pool
 from lib.forward_model.scanner_template import ScannerTemplate,\
                                                default_two_view_conebeam
 
@@ -98,6 +99,57 @@ liquid_pdf = [1/2., 1/2.]
 custom_objects = [os.path.join(CUSTOM_SHAPES_DIR, s)
                   for s in os.listdir(CUSTOM_SHAPES_DIR)]
 
+# STL object pool configuration ------------------------------------------------
+stl_pool_config = dict(
+    bags=dict(
+        pool=discover_pool(STL_BAGS_DIR),
+        materials=['neoprene', 'nylon6'],
+        material_pdf=[0.5, 0.5],
+    ),
+    threats=dict(
+        firearms=dict(
+            pool=discover_pool(STL_FIREARMS_DIR),
+            count_range=(0, 2),
+            materials=['Fe', 'Al'],
+            material_pdf=[0.7, 0.3],
+        ),
+        sharp_objects=dict(
+            pool=discover_pool(STL_SHARP_DIR),
+            count_range=(0, 2),
+            materials=['Fe', 'Ti'],
+            material_pdf=[0.6, 0.4],
+        ),
+        explosives=dict(
+            pool=discover_pool(STL_EXPLOSIVES_DIR),
+            count_range=(0, 1),
+            materials=['ethanol', 'acetal', 'acrylic'],
+            material_pdf=[0.4, 0.3, 0.3],
+        ),
+        other=dict(
+            pool=discover_pool(STL_OTHER_THREATS_DIR),
+            count_range=(0, 1),
+            materials=['acetal', 'bakelite'],
+            material_pdf=[0.5, 0.5],
+        ),
+    ),
+    fillers=dict(
+        pool=discover_pool(STL_FILLERS_DIR),
+        count_range=(5, 15),
+        materials=mlist,
+        material_pdf=material_pdf,
+    ),
+    liquid_containers=dict(
+        pool=discover_pool(STL_LIQUID_CONTAINERS_DIR),
+        count_range=(0, 3),
+        container_materials=['pyrex', 'polyethylene', 'acrylic'],
+        container_material_pdf=[0.4, 0.3, 0.3],
+        liquid_materials=['water'],
+        liquid_material_pdf=[1.0],
+    ),
+    voxel_resolution=64,
+)
+# ------------------------------------------------------------------------------
+
 bag_creator_args = dict(
     # list of materials/liquids to simulate -----------------------------------
     material_list=mlist,
@@ -120,7 +172,10 @@ bag_creator_args = dict(
     # -------------------------------------------------------------------------
     # specifications for metals / target objects
     metal_dict={'metal_amt':  1e2, 'metal_size': (3,5)},
-    target_dict={'num_range': (1,3), 'is_liquid': False}
+    target_dict={'num_range': (1,3), 'is_liquid': False},
+    # -------------------------------------------------------------------------
+    # STL object pool configuration
+    stl_pool_config=stl_pool_config,
     # -------------------------------------------------------------------------
 )
 # -----------------------------------------------------------------------------
