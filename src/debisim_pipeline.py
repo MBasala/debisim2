@@ -793,18 +793,19 @@ class DEBISimPipeline(object):
         del voxel_mat_idx_safe_gpu, bg_mask_gpu, lac_lut_gpu
 
         # Free torch's cached GPU memory so ASTRA can use the full VRAM.
-        torch.cuda.empty_cache()
-        try:
-            _free, _total = torch.cuda.mem_get_info(0)
-            astra.set_gpu_index(0, memory=int(_free * 0.9))
-            self.logger.info(
-                f"ASTRA GPU memory: {_free/1e9:.1f} GB free of "
-                f"{_total/1e9:.1f} GB total")
-        except Exception:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
             try:
-                astra.set_gpu_index(0)
+                _free, _total = torch.cuda.mem_get_info(0)
+                astra.set_gpu_index(0, memory=int(_free * 0.9))
+                self.logger.info(
+                    f"ASTRA GPU memory: {_free/1e9:.1f} GB free of "
+                    f"{_total/1e9:.1f} GB total")
             except Exception:
-                pass
+                try:
+                    astra.set_gpu_index(0)
+                except Exception:
+                    pass
         # --------------------------------------------------------------------------
 
         # Accumulation buffer on GPU — post-processing (exp, noise) runs on GPU.

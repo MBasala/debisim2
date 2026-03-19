@@ -390,9 +390,17 @@ def save_fits_data_async(file_path, out_image, compress=False):
     data_copy = out_image.copy()
     fut = _get_io_pool().submit(save_fits_data, file_path, data_copy, compress)
     with _io_lock:
-        # Prune completed futures to avoid unbounded growth
-        _io_futures[:] = [f for f in _io_futures if not f.done()]
-        _io_futures.append(fut)
+        # Prune completed futures — surface any write failures immediately
+        surviving = []
+        for f in _io_futures:
+            if f.done():
+                exc = f.exception()
+                if exc is not None:
+                    raise exc
+            else:
+                surviving.append(f)
+        surviving.append(fut)
+        _io_futures[:] = surviving
 
 
 def flush_async_io():
