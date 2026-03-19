@@ -1,5 +1,5 @@
 # ===========================================================================
-# DEBISim2 Docker Image
+# DEBISim2p5 Docker Image
 #
 # Multi-stage build:
 #   Stage 1 (gpufit-builder): compile gpufit from source with CUDA

@@ -1,9 +1,9 @@
 services:
-  debisim2:
+  debisim2p5:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: debisim2:latest
+    image: debisim2p5:latest
 
     # GPU access — requires NVIDIA Container Toolkit
     deploy:
