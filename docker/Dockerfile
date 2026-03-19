@@ -6,15 +6,24 @@
 #   Stage 2 (deps-builder):   install all Python deps into a venv via uv
 #   Stage 3 (runtime):        slim CUDA base image + venv + app code
 #
-# Usage (from docker/ directory):
+# Build args:
+#   CUDA_VERSION  - CUDA version tag (default: 12.6.3)
+#   TORCH_INDEX   - PyTorch wheel index (default: cu126)
+#
+# Usage:
+#   # CUDA 12.6 (RunPod / cloud compatible — verified CUDA 12.x runtime):
 #   docker compose build
-#   docker compose run debisim2p5 --config configs/config_calibration_phantom_dect.py
+#
+#   # CUDA 12.8 (may pull CUDA 13.x due to NVIDIA re-tagging):
+#   docker compose build --build-arg CUDA_VERSION=12.8.1 --build-arg TORCH_INDEX=cu128
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
 
+ARG CUDA_VERSION=12.6.3
+
 # ---- Stage 1: Build gpufit from source ------------------------------------
-FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS gpufit-builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS gpufit-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -38,8 +47,10 @@ RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ 
     python3 -m pip wheel . --no-deps -w /wheels/
 
 # ---- Stage 2: Install Python deps into a venv ----------------------------
-FROM nvidia/cuda:12.8.1-base-ubuntu24.04 AS deps-builder
+ARG CUDA_VERSION
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04 AS deps-builder
 
+ARG TORCH_INDEX=cu126
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -63,17 +74,18 @@ COPY --from=gpufit-builder /wheels/ /tmp/wheels/
 
 # Install all Python dependencies
 RUN uv pip install --no-cache \
-        torch --index-url https://download.pytorch.org/whl/cu128 && \
+        torch --index-url https://download.pytorch.org/whl/${TORCH_INDEX} && \
     uv pip install --no-cache \
         astra-toolbox \
-        pyyaml tabulate scikit-image scipy \
+        pyyaml tabulate scikit-image scikit-learn scipy \
         trimesh tqdm matplotlib pydicom astropy psutil brt \
-        scipy-stubs && \
+        scipy-stubs runpod && \
     uv pip install --no-cache /tmp/wheels/*.whl && \
     rm -rf /tmp/wheels
 
 # ---- Stage 3: Slim runtime image -----------------------------------------
-FROM nvidia/cuda:12.8.1-base-ubuntu24.04
+ARG CUDA_VERSION
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -81,9 +93,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN useradd -m -s /bin/bash debisim
 
 # Minimal runtime dependencies (no uv, no pip, no -dev)
+# PyTorch cu126 wheels bundle their own CUDA runtime (libcublas, libcusparse,
+# etc.) so we do NOT install system CUDA libs — avoids 15+ GB of duplicates.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv \
-        libgomp1 libcublas-12-8 libcusparse-12-8 \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
@@ -103,6 +117,8 @@ COPY --chown=debisim:debisim examples/ /app/examples/
 COPY --chown=debisim:debisim benchmarks/ /app/benchmarks/
 COPY --chown=debisim:debisim tests/ /app/tests/
 COPY --chown=debisim:debisim run_dataset_generator.py /app/
+COPY --chown=debisim:debisim handler.py /app/
+COPY --chown=debisim:debisim .runpod/ /app/.runpod/
 
 # Results directory
 RUN mkdir -p /app/results && chown debisim:debisim /app/results
@@ -116,7 +132,5 @@ ENV PYTHONUNBUFFERED=1
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "from src.debisim_pipeline import DEBISimPipeline; print('OK')"
 
-ENTRYPOINT ["python", "run_dataset_generator.py"]
-CMD ["--config", "configs/config_calibration_phantom_dect.py", \
-     "--sim_dir", "results/calibration_phantom/", \
-     "--num_bags", "1"]
+# RunPod serverless entrypoint (also works standalone via run_dataset_generator.py)
+ENTRYPOINT ["python", "-u", "handler.py"]
