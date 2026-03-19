@@ -90,7 +90,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copy the fully-built venv from stage 2 (no uv/pip/build tools)
+# Copy the fully-built venv from stage 2
 COPY --from=deps-builder --chown=debisim:debisim /app/.venv /app/.venv
 
 # Copy application code
