@@ -24,9 +24,10 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 warnings.filterwarnings('ignore')
 
-from src.debisim_pipeline import *
-from lib.decomposer.cdm_decomposer import *
-from lib.misc.benchmark import *
+import torch
+from src.debisim_pipeline import DEBISimPipeline
+from lib.misc.benchmark import Benchmark
+from lib.misc.util import flush_async_io
 
 img_suffixes = dict(
     cdm=['c', 'pe', 'z'],

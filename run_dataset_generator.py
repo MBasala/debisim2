@@ -14,12 +14,14 @@ __email__     = ["amanerik@purdue.edu", "li1208@purdue.edu"]
 __status__    = "Prototype"
 # -----------------------------------------------------------------------------
 
+import os
 import warnings
 warnings.filterwarnings('ignore')
 import argparse
 import importlib.util as config_loader
 
-from src.debisim_dataset_generator import *
+from src.debisim_dataset_generator import run_xray_dataset_generator
+from lib.__init__ import CONFIG_DIR, RESULTS_DIR
 
 
 if __name__ == '__main__':

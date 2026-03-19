@@ -4,7 +4,7 @@ import matplotlib as mpl
 from pylab import *
 from numpy import *
 
-import os, pickle, pydicom
+import os, pickle, pydicom, logging.handlers
 import scipy.sparse as sp
 import scipy.misc as misc
 from concurrent.futures import ThreadPoolExecutor
@@ -93,8 +93,16 @@ def get_logger(lname, logfile):
     logger = logging.getLogger(lname)
     logger.setLevel(logging.INFO)
 
-    # Create file handler
+    # Create file handler with 64KB write buffer to reduce I/O syscalls.
+    # MemoryHandler batches log records and flushes when the buffer is full
+    # or when a record at WARNING or above is emitted.
     f_handler = logging.FileHandler(logfile, mode='a')
+    buffered_f_handler = logging.handlers.MemoryHandler(
+        capacity=64 * 1024,           # buffer up to 64KB of records
+        flushLevel=logging.WARNING,   # flush immediately on warnings/errors
+        target=f_handler,
+    )
+
     s_handler = logging.StreamHandler(sys.stdout)
 
     # Create formatter
@@ -103,7 +111,7 @@ def get_logger(lname, logfile):
     f_handler.setFormatter(formatter)
     s_handler.setFormatter(formatter)
 
-    logger.addHandler(f_handler)
+    logger.addHandler(buffered_f_handler)
     logger.addHandler(s_handler)
     logger.propagate = False
 
