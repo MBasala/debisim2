@@ -49,7 +49,11 @@ Decomposition.
 """
 
 from lib.decomposer.de_decomposer import *
-import pygpufit.gpufit as gf
+
+try:
+    import pygpufit.gpufit as gf
+except ImportError:
+    gf = None
 
 
 class CDMDecomposer(DEDecomposer):
@@ -130,6 +134,12 @@ class CDMDecomposer(DEDecomposer):
         :param  theta                   - angles where projections took place
         :param  projector               - projector to use
         ---------------------------------------------------------------------"""
+
+        if gf is None:
+            raise ImportError(
+                "CDMDecomposer requires pygpufit (custom build with "
+                "COMPTON_PE model). Install the wheel from deps/gpufit/ "
+                "or set decomposer='none' in your config.")
 
         DEDecomposer.__init__(self, spctr_h_fname, spctr_l_fname,
                               photon_count_low, photon_count_high,
