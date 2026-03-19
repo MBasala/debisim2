@@ -856,7 +856,7 @@ class DEBISimPipeline(object):
                 precomp_buf[k - batch_start])
 
             # --- torch GPU — Beer-Lambert + noise + accumulate ----------------
-            curr = torch.as_tensor(proj_np, device='cuda')
+            curr = torch.as_tensor(proj_np, device=_gt_device)
             del proj_np
 
             scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
@@ -996,7 +996,8 @@ class DEBISimPipeline(object):
 
         projn = projn + scatter_projn.T
 
-        s_projn = torch.as_tensor(projn, dtype=torch.float, device='cuda')
+        _device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        s_projn = torch.as_tensor(projn, dtype=torch.float, device=_device)
 
         s_projn = torch.where(s_projn<1,
                               torch.Tensor([1.0]), s_projn)

@@ -192,10 +192,9 @@ class TestDicomSeries:
     def test_dicom_pixel_data_roundtrip(self, tmp_dir):
         """Verify pixel values survive the DICOM save→load cycle.
 
-        The DICOM writer stores values as int16 with RescaleIntercept=-1024
-        (standard HU convention).  Input values are treated as raw LAC or
-        pre-offset values — the writer adds 1024 before casting to uint16,
-        so we must account for quantisation when comparing.
+        The DICOM writer stores values as signed int16 with
+        RescaleIntercept=0 and RescaleSlope=1.  Input values are
+        clipped to [-32768, 32767] and cast directly to int16.
         """
         import pydicom
         vol = np.zeros((16, 16, 4), dtype=np.float32)

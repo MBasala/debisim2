@@ -515,10 +515,9 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
             ds.NumberOfDetectorRows = str(det_rows)
         if det_cols != '':
             ds.NumberOfDetectorColumns = str(det_cols)
-        if anode_angle != '':
-            ds.FocalSpotSize = str(anode_angle)
-        if num_views != '':
-            ds.NumberOfFrames = str(num_views)
+        # Note: anode_angle is not stored — DICOM FocalSpotSize is a physical
+        # size (mm), not an angle.  NumberOfFrames is omitted because each
+        # file is a single-frame CT slice.
         ds.ConvolutionKernel = str(recon_algo)
         ds.FilterType = str(recon_algo)
         ds.ContentDate = date_str
@@ -610,6 +609,8 @@ def create_rtstruct(output_path, roi_list, gt_label_volume,
     ds.SOPClassUID = '1.2.840.10008.5.1.1.481.3'  # RT Structure Set Storage
     ds.SOPInstanceUID = uid.generate_uid()
     ds.StudyInstanceUID = ct_series_uids['study_uid']
+    ds.SeriesInstanceUID = uid.generate_uid()
+    ds.SeriesNumber = '99'
     ds.Modality = 'RTSTRUCT'
     ds.Manufacturer = 'DEBISim2'
     ds.PatientID = patient_id

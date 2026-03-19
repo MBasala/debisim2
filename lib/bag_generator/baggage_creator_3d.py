@@ -1023,18 +1023,16 @@ class BaggageImage3D(object):
         self.logger.info('\n')
     # -------------------------------------------------------------------------
 
-    def replace_boundary_with_stl(self, stl_path, mm_per_voxel=1.0,
-                                   mesh_units='m'):
+    def replace_boundary_with_stl(self, stl_path, mesh_units='m'):
         """
         -----------------------------------------------------------------------
         Replace the default cubic bag boundary with a voxelized STL bag shape.
 
-        The STL bag is loaded at native scale (converted to mm via
-        ``mesh_units``), then uniformly scaled to fit inside the cavity
-        region ``(2*bb_h)^3`` while preserving its aspect ratio.
+        The STL bag is loaded at a coarse resolution (128 voxels on longest
+        axis), converted to mm via ``mesh_units``, then uniformly scaled to
+        fit inside the cavity region ``(2*bb_h)^3`` preserving aspect ratio.
 
         :param stl_path:        path to the STL file for the bag shape
-        :param mm_per_voxel:    mm per scene voxel (default 1.0)
         :param mesh_units:      unit system of the STL file (default 'm')
         :return:
         -----------------------------------------------------------------------
