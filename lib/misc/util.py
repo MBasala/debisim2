@@ -360,9 +360,20 @@ def save_fits_data(file_path, out_image, compress=False):
 # copied (numpy array) before submission so the caller can safely mutate
 # or delete the original without corrupting the write.
 
-_io_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='fits_io')
+_io_pool = None
 _io_futures = []
 _io_lock = threading.Lock()
+
+
+def _get_io_pool():
+    """Lazily create the I/O thread pool on first use."""
+    global _io_pool
+    if _io_pool is None:
+        import atexit
+        _io_pool = ThreadPoolExecutor(max_workers=2,
+                                       thread_name_prefix='fits_io')
+        atexit.register(_io_pool.shutdown, wait=True)
+    return _io_pool
 
 
 def save_fits_data_async(file_path, out_image, compress=False):
@@ -377,7 +388,7 @@ def save_fits_data_async(file_path, out_image, compress=False):
     :param compress:    whether to use FITS compression
     """
     data_copy = out_image.copy()
-    fut = _io_pool.submit(save_fits_data, file_path, data_copy, compress)
+    fut = _get_io_pool().submit(save_fits_data, file_path, data_copy, compress)
     with _io_lock:
         # Prune completed futures to avoid unbounded growth
         _io_futures[:] = [f for f in _io_futures if not f.done()]

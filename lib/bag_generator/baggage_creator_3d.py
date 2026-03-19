@@ -1099,7 +1099,8 @@ class BaggageImage3D(object):
         :param grid:        (rows, cols) grid dimensions
         :param block_size:  side length of each cube in voxels
         :param gap:         spacing between cubes in voxels
-        :return:            list of Object3D instances
+        :return:            None — mutates self.ws_bag, self.param_file,
+                            and self.virtual_bag in place
         -----------------------------------------------------------------------
         """
         rows, cols = grid
@@ -1309,8 +1310,7 @@ class BaggageImage3D(object):
                 if len(bag_pool) > 0:
                     bag_stl = np.random.choice(bag_pool)
                     self.replace_boundary_with_stl(
-                        bag_stl, mm_per_voxel=mm_per_voxel,
-                        mesh_units=mesh_units)
+                        bag_stl, mesh_units=mesh_units)
                 else:
                     self.logger.warning(
                         "use_stl_bag=True but no STL bag files found in pool")

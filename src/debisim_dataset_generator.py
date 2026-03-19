@@ -17,6 +17,7 @@ __email__     = ["amanerik@purdue.edu", "li1208@purdue.edu"]
 __status__    = "Prototype"
 # -----------------------------------------------------------------------------
 
+import os
 import warnings
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, as_completed
