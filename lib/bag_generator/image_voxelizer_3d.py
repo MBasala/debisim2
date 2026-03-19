@@ -282,7 +282,7 @@ class ImageVoxelizer3D(object):
         ref_image =   zeros((2*radius+1, 2*radius+1, 2*int(dist)))
 
         cyl_circle =   zeros((2*radius+1, 2*radius+1))
-        rr, cc = disk(radius + 1, radius + 1, radius=radius)
+        rr, cc = disk((radius + 1, radius + 1), radius, shape=cyl_circle.shape)
         cyl_circle[rr, cc] = 1
 
         for i in range(int(dist),2*int(dist)):
@@ -348,7 +348,7 @@ class ImageVoxelizer3D(object):
                     circ_rad = radius2
 
                 cyl_circle =   zeros((2 * radius2 + 1, 2 * radius2 + 1))
-                rr, cc = disk(radius2 + 1, radius2 + 1, radius=circ_rad)
+                rr, cc = disk((radius2 + 1, radius2 + 1), circ_rad, shape=cyl_circle.shape)
                 cyl_circle[rr, cc] = 1
                 ref_image[:, :, i] = cyl_circle
         else:
@@ -365,7 +365,7 @@ class ImageVoxelizer3D(object):
                 if circ_rad >radius1:
                     circ_rad = radius1
                 cyl_circle =   zeros((2 * radius1 + 1, 2 * radius1 + 1))
-                rr, cc = disk(radius1 + 1, radius1 + 1, radius=circ_rad)
+                rr, cc = disk((radius1 + 1, radius1 + 1), circ_rad, shape=cyl_circle.shape)
                 cyl_circle[rr, cc] = 1
                 ref_image[:, :, i] = cyl_circle
 

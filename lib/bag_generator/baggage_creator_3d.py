@@ -1270,7 +1270,7 @@ class BaggageImage3D(object):
         pose_diff = pose_range[1] - pose_range[0]
         self.pose_range = pose_range
 
-        number_of_objects = random.choice(number_of_objects) \
+        number_of_objects = np.random.choice(number_of_objects) \
                             if not isscalar(number_of_objects) \
                             else number_of_objects
 
@@ -1449,9 +1449,9 @@ class BaggageImage3D(object):
                     lqd_mat = np.random.choice(lqd_materials, p=lqd_mat_pdf)
 
                     lqd_param = dict(
-                        lqd_level=random.random() * 0.5 + 0.4,
+                        lqd_level=np.random.random() * 0.5 + 0.4,
                         lqd_material=lqd_mat,
-                        cntr_thickness=random.choice(sheet_dim_list),
+                        cntr_thickness=np.random.choice(sheet_dim_list),
                         lqd_label=self.lqd_count
                     )
                     self.lqd_count += 1
@@ -1562,7 +1562,7 @@ class BaggageImage3D(object):
 
             # if liquids are to be spawned randomly choose the object to be a
             # liquid-filled container
-            liquid_option = random.choice([True, False],
+            liquid_option = np.random.choice([True, False],
                                           p =[lqd_prob, 1 - lqd_prob]) \
                             and cshape!='S' and cshape!='M' \
                             and spawn_liquids
@@ -1579,9 +1579,9 @@ class BaggageImage3D(object):
             if liquid_option:
 
                 lqd_param = dict(
-                    lqd_level=random.random()*0.5+0.4,
-                    lqd_material=random.choice(liquid_list, p=liquid_pdf),
-                    cntr_thickness=random.choice(sheet_dim_list),
+                    lqd_level=np.random.random()*0.5+0.4,
+                    lqd_material=np.random.choice(liquid_list, p=liquid_pdf),
+                    cntr_thickness=np.random.choice(sheet_dim_list),
                     lqd_label=self.lqd_count
                 )
                 self.lqd_count += 1
@@ -1589,7 +1589,7 @@ class BaggageImage3D(object):
                 if lqd_param['lqd_material'] in lqd_target_list:
                     if target_dict['num_range'] is not None \
                         and target_counter==target_dict['num_range'][1]:
-                        lqd_param['lqd_material'] = random.choice(lqd_non_target_list)
+                        lqd_param['lqd_material'] = np.random.choice(lqd_non_target_list)
                     else:
                         target_counter += 1
 
@@ -1652,14 +1652,14 @@ class BaggageImage3D(object):
                 if contains_liquid:
 
                     if target_dict['is_liquid']:
-                        lqd_material = random.choice(lqd_target_list)
+                        lqd_material = np.random.choice(lqd_target_list)
                     else:
-                        lqd_material = random.choice(lqd_non_target_list)
+                        lqd_material = np.random.choice(lqd_non_target_list)
 
                     lqd_param = dict(
-                        lqd_level=random.random() * 0.5 + 0.4,
+                        lqd_level=np.random.random() * 0.5 + 0.4,
                         lqd_material=lqd_material,
-                        cntr_thickness=random.choice(sheet_dim_list),
+                        cntr_thickness=np.random.choice(sheet_dim_list),
                         lqd_label=self.lqd_count
                     )
                     self.lqd_count += 1
