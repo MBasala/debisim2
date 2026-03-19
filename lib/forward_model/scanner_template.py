@@ -567,6 +567,14 @@ class ScannerTemplate(object):
         -----------------------------------------------------------------------
         """
 
+        # Tell ASTRA which GPU to use so it can query available memory
+        # instead of defaulting to 1 GB.  Must be called before any
+        # ASTRA GPU operation.
+        try:
+            astra.set_gpu_index(0)
+        except Exception:
+            pass
+
         g = {}
         g['n_views']        = self.recon_params['n_views']
         g['image_dims']     = self.recon_params['image_dims']
@@ -589,8 +597,21 @@ class ScannerTemplate(object):
                                                 self.recon_geometry['angles']
                                                 )
 
-        ramlak = np.squeeze(io.loadmat(self.recon_params['ramlak'])['myFilter'])
-        self.ramlak = ramlak.astype(complex)
+        # Generate Ram-Lak filter sized to the actual detector column count
+        # rather than loading from a fixed-size .mat file.
+        # Shape: (n_det, n_views) — matching the original .mat format.
+        n_det = self.machine_geometry['det_col_count']
+        n_views = self.recon_geometry['n_views']
+        ramlak_1d = np.zeros(n_det, dtype=np.float64)
+        ramlak_1d[0] = 0.25
+        for k in range(1, n_det):
+            if k % 2 == 1:
+                ramlak_1d[k] = -1.0 / (np.pi * k) ** 2
+        ramlak_freq = np.fft.fft(ramlak_1d)
+        # Tile to (n_det, n_views) to match the original filter shape
+        self.ramlak = np.tile(
+            ramlak_freq[:, np.newaxis], (1, n_views)
+        ).astype(complex)
     # -------------------------------------------------------------------------
 
     def _run_cone_vec_equi_space_fp(self, vol_data, verbose=False):
@@ -647,34 +668,67 @@ class ScannerTemplate(object):
                                 (dim.: n_rows x n_cols x (n_views*n_rot))
         -----------------------------------------------------------------------
         """
-        # Run forward projection on a 3D volume
+        # NOTE: astra.set_gpu_index() is called once before the energy loop
+        # in debisim_pipeline.py — NOT here, to avoid resetting ASTRA's GPU
+        # state on every projection call.
 
-        # Check the cone_vec geometry
+        # Run forward projection on a 3D volume
         assert self.proj_geom['type'] == 'parallel3d'
 
-        vol_geom = astra.create_vol_geom(*vol_data.shape)
-        vol_data = transpose(vol_data, (2,0,1))
+        # vol_geom must be created from the ORIGINAL (H, W, D) shape.
+        # ASTRA's data ordering is (D, H, W) after transpose.
+        orig_shape = vol_data.shape
+        vol_data = transpose(vol_data, (2, 0, 1))
 
-        # Create volume geometry, astra requires a bit exchange of axes
+        if verbose:
+            self.logger.info(f"Volume data has shape {vol_data.shape}")
 
-        if verbose:  self.logger.info(f"Volume data has shape {vol_data.shape}")
+        # Reuse ASTRA geometry objects across calls when the volume shape
+        # hasn't changed — avoids expensive GPU alloc/free per keV step.
+        if (not hasattr(self, '_astra_cache') or
+                self._astra_cache.get('orig_shape') != orig_shape):
+            # First call or shape changed — create new ASTRA objects
+            if hasattr(self, '_astra_cache'):
+                astra.data3d.delete(self._astra_cache['vol_id'])
+                astra.data3d.delete(self._astra_cache['proj_id'])
+                astra.algorithm.delete(self._astra_cache['alg_id'])
 
-        dims = self.recon_geometry['image_dims'][2], \
-               self.recon_geometry['image_dims'][0], \
-               self.recon_geometry['image_dims'][1]
-        proj_id, proj_data = astra.create_sino3d_gpu(
-            vol_data, self.proj_geom, vol_geom)
+            vol_geom = astra.create_vol_geom(*orig_shape)
+            vol_id = astra.data3d.create('-vol', vol_geom, data=vol_data)
+            proj_id = astra.data3d.create('-sino', self.proj_geom)
 
-        # Do forward projection based on cone vec geometry
-        if verbose:  self.logger.info("Starting forward projection...")
-        t0 = time.time()
+            cfg = astra.astra_dict('FP3D_CUDA')
+            cfg['VolumeDataId'] = vol_id
+            cfg['ProjectionDataId'] = proj_id
+            alg_id = astra.algorithm.create(cfg)
 
-        if verbose:  self.logger.info("Done, took %.3fs..." % (time.time() - t0))
-        if verbose:  self.logger.info(f"Projection has shape {proj_data.shape}")
+            self._astra_cache = dict(
+                orig_shape=orig_shape,
+                vol_geom=vol_geom,
+                vol_id=vol_id,
+                proj_id=proj_id,
+                alg_id=alg_id,
+            )
+        else:
+            # Same shape — just update the volume data in place
+            astra.data3d.store(self._astra_cache['vol_id'], vol_data)
 
-        astra.data3d.delete(proj_id)
+        # Run the forward projection
+        astra.algorithm.run(self._astra_cache['alg_id'])
+        proj_data = astra.data3d.get(self._astra_cache['proj_id'])
+
+        if verbose:
+            self.logger.info(f"Projection has shape {proj_data.shape}")
 
         return proj_data
+
+    def cleanup_astra_cache(self):
+        """Free cached ASTRA GPU objects (call between spectra or at end)."""
+        if hasattr(self, '_astra_cache'):
+            astra.data3d.delete(self._astra_cache['vol_id'])
+            astra.data3d.delete(self._astra_cache['proj_id'])
+            astra.algorithm.delete(self._astra_cache['alg_id'])
+            del self._astra_cache
     # -------------------------------------------------------------------------
 
     def _run_cone_equi_space_fp(self, vol_data, verbose=False):
@@ -861,6 +915,23 @@ class ScannerTemplate(object):
         """
         self.logger.info("\n\nRunning parallel beam FBP...")
 
+        # Ensure ASTRA uses the full GPU memory (once per process)
+        if not getattr(self, '_astra_gpu_set', False):
+            try:
+                import torch as _t
+                if _t.cuda.is_available():
+                    _free, _total = _t.cuda.mem_get_info(0)
+                    astra.set_gpu_index(0, memory=int(_free * 0.9))
+                else:
+                    astra.set_gpu_index(0)
+                self._astra_gpu_set = True
+            except Exception:
+                try:
+                    astra.set_gpu_index(0)
+                    self._astra_gpu_set = True
+                except Exception:
+                    pass
+
         self.logger.info(f"Input sinogram shape is {sino.shape}")
         t0 = time.time()
 
@@ -898,7 +969,8 @@ class ScannerTemplate(object):
             sino_freq = np.fft.fft(sino, axis=0)  # FFT
             filtered_freq = self.ramlak[:,newaxis,:] * sino_freq  # use ram-lak filter
             filtered_sino = np.fft.ifft(filtered_freq, axis=0)  # IFFT
-            filtered_sino = np.real(filtered_sino[0:1024, :])
+            n_det = self.machine_geometry['det_col_count']
+            filtered_sino = np.real(filtered_sino[0:n_det, :])
 
             sino = moveaxis(filtered_sino, 0, -1)
 
@@ -1098,7 +1170,15 @@ class ScannerTemplate(object):
                                      mode='nearest')
             vol_data = up_sampler(vol_data.unsqueeze(0).unsqueeze(0))
 
-        projn = self.run_fwd_projector(vol_data.squeeze().cpu().numpy())
+        # Convert to numpy for ASTRA, then free torch's GPU cache so ASTRA
+        # can allocate the VRAM it needs for the projection kernel.
+        vol_np = vol_data.squeeze().cpu().numpy()
+        del vol_data
+        torch.cuda.empty_cache()
+
+        projn = self.run_fwd_projector(vol_np)
+        del vol_np
+
         projn = torch.as_tensor(projn, dtype=torch.float)
         projn = torch.neg(projn)
         projn = torch.exp(projn)
@@ -1245,6 +1325,75 @@ class ScannerTemplate(object):
             noisy_projn = projn*self.detector_gain[newaxis, newaxis, :]
             return noisy_projn
     # -------------------------------------------------------------------------
+
+
+def create_parallel_scanner(gantry_diameter_mm=512,
+                            pixel_size_mm=1.0,
+                            n_slices=350,
+                            n_views=720,
+                            view_range=180.0,
+                            pscale=1.0):
+    """
+    ---------------------------------------------------------------------------
+    Factory function to create a parallel-beam scanner from physical
+    dimensions.  Derives all dependent parameters (image_dims, det_spacing,
+    det_col_count) from the two primary inputs.
+
+    :param gantry_diameter_mm:  physical diameter of the scanning FOV in mm
+    :param pixel_size_mm:       reconstructed pixel size in mm
+    :param n_slices:            number of slices (z-extent of recon volume)
+    :param n_views:             number of projection views over view_range
+    :param view_range:          angular range in degrees (180 for parallel)
+    :param pscale:              projection scale factor (default 1.0)
+    :return:                    configured ScannerTemplate instance
+    ---------------------------------------------------------------------------
+    """
+    import math
+
+    n_pixels = int(math.ceil(gantry_diameter_mm / pixel_size_mm))
+    # det_spacing_y determines img_scale via 1/det_spacing_y
+    # For the recon pixel to equal pixel_size_mm:
+    #   recon_pixel = gantry_diameter / n_pixels = pixel_size_mm
+    #   det_spacing_y is the physical detector element pitch — for parallel
+    #   beam it equals the recon pixel size.
+    det_spacing_y = pixel_size_mm
+    det_col_count = n_pixels
+
+    machine_dict = dict(
+        scanner_name='parallel_custom',
+        gantry_diameter=gantry_diameter_mm,
+        det_spacing_y=det_spacing_y,
+        det_spacing_x=pixel_size_mm,     # axial spacing = pixel size
+        det_col_count=det_col_count,
+        det_row_count=n_slices,
+    )
+
+    recon_dict = dict(
+        n_views=n_views,
+        view_range=view_range,
+        slice_thickness=pixel_size_mm,
+        image_dims=(n_pixels, n_pixels, n_slices),
+        ramlak=RAMLAK_FILTER_FILE,
+        img_scale=1.0 / det_spacing_y,
+        mu_w=default_scanner_parallel.recon_params['mu_w'],
+    )
+
+    scanner = ScannerTemplate(
+        geometry='parallel',
+        scan='circular',
+        machine_dict=machine_dict,
+        recon='fbp',
+        recon_dict=recon_dict,
+        pscale=pscale,
+    )
+    scanner.set_recon_geometry()
+
+    print(f"Scanner created: FOV={gantry_diameter_mm}mm, "
+          f"pixel={pixel_size_mm}mm, "
+          f"image={n_pixels}x{n_pixels}x{n_slices}, "
+          f"det_cols={det_col_count}")
+
+    return scanner
 
 
 if __name__=="__main__":

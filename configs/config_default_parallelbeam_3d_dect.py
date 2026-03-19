@@ -22,7 +22,8 @@ __status__    = "Prototype"
 from lib.__init__ import *
 from lib.misc.stl_loader import discover_pool
 from lib.forward_model.scanner_template import ScannerTemplate,\
-                                               default_scanner_parallel
+                                               default_scanner_parallel,\
+                                               create_parallel_scanner
 
 # -----------------------------------------------------------------------------
 # Step 1: Specify dataset parameter:
@@ -32,16 +33,27 @@ sim_dir        = 'results/example_parallelbeam_3d_dect/' # simulation directory
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
-# Step 2: Specify Scanner Model using scanner_template.py
+# Step 2: Specify Scanner Model
+#
+# Two physical parameters control the scanning geometry:
+#   gantry_diameter_mm  — the reconstruction field-of-view diameter (mm)
+#   pixel_size_mm       — the reconstructed voxel size (mm)
+#
+# Everything else (image_dims, det_spacing, det_col_count) is derived.
+#
+# Option 2 (current): 1024 mm FOV at 2 mm/voxel → 512×512 image
+#   Fits objects up to ~700 mm (e.g. M4 carbine at 838 mm diagonally).
+#   Same render time as original 512×512 setup.
+#
+# Option 1 (high-res): 1024 mm FOV at 1 mm/voxel → 1024×1024 image
+#   Full 1 mm resolution, but ~4× slower rendering.
+#   To switch: set pixel_size_mm=1.0
 
-scanner_mdl = ScannerTemplate(geometry='parallel',
-                              scan='circular',
-                              machine_dict=default_scanner_parallel.machine_geometry,
-                              recon='fbp',
-                              recon_dict=default_scanner_parallel.recon_params,
-                              pscale=1.0)
-
-scanner_mdl.set_recon_geometry()
+scanner_mdl = create_parallel_scanner(
+    gantry_diameter_mm=1024,    # real security belt FOV ~650-1000 mm
+    pixel_size_mm=2.0,          # 2 mm/voxel (change to 1.0 for high-res)
+    n_slices=350,
+)
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -99,6 +111,7 @@ custom_objects = [os.path.join(CUSTOM_SHAPES_DIR, s)
 
 # STL object pool configuration ------------------------------------------------
 stl_pool_config = dict(
+    use_stl_bag=True,               # always use a random STL bag boundary
     bags=dict(
         pool=discover_pool(STL_BAGS_DIR),
         materials=['neoprene', 'nylon6'],
@@ -107,24 +120,28 @@ stl_pool_config = dict(
     threats=dict(
         firearms=dict(
             pool=discover_pool(STL_FIREARMS_DIR),
-            count_range=(0, 2),
+            spawn_prob=1,         # 50% chance firearms appear in a bag
+            count_range=(2, 2),     # if they appear: 0-2 items
             materials=['Fe', 'Al'],
             material_pdf=[0.7, 0.3],
         ),
         sharp_objects=dict(
             pool=discover_pool(STL_SHARP_DIR),
+            spawn_prob=0.5,         # 50% chance sharp objects appear
             count_range=(0, 2),
             materials=['Fe', 'Ti'],
             material_pdf=[0.6, 0.4],
         ),
         explosives=dict(
             pool=discover_pool(STL_EXPLOSIVES_DIR),
+            spawn_prob=0.3,         # 30% chance explosives appear
             count_range=(0, 1),
             materials=['ethanol', 'acetal', 'acrylic'],
             material_pdf=[0.4, 0.3, 0.3],
         ),
         other=dict(
             pool=discover_pool(STL_OTHER_THREATS_DIR),
+            spawn_prob=0.3,         # 30% chance other threats appear
             count_range=(0, 1),
             materials=['acetal', 'bakelite'],
             material_pdf=[0.5, 0.5],
@@ -144,7 +161,14 @@ stl_pool_config = dict(
         liquid_materials=['water'],
         liquid_material_pdf=[1.0],
     ),
-    voxel_resolution=64,
+    # mm_per_voxel: real-world size of each scene voxel.
+    # Must match pixel_size_mm from the scanner above.
+    # 1024mm FOV / 512px = 2.0 mm/voxel
+    mm_per_voxel=2.0,
+    # mesh_units: unit system of the STL files.
+    # Most 3D modelling tools export in metres by default.
+    # Supported: 'mm', 'cm', 'in'/'inches', 'm'/'meters'
+    mesh_units='m',
 )
 # ------------------------------------------------------------------------------
 
@@ -175,6 +199,13 @@ bag_creator_args = dict(
     # STL object pool configuration
     stl_pool_config=stl_pool_config,
     # -------------------------------------------------------------------------
+    # overlap prevention — when True, objects are laterally shifted during
+    # placement so that most objects do not overlap each other
+    prevent_overlap=True,
+    # stl_only — when True, only STL pool objects are spawned (threats,
+    # fillers, liquid containers); random primitive shapes (ellipsoids,
+    # boxes, cylinders, cones, sheets, custom meshes) are disabled
+    stl_only=True,
 )
 # -----------------------------------------------------------------------------
 # Step 4 Specify the Dual Energy Decomposition Method
@@ -184,7 +215,7 @@ decomp_method = 'cdm' # constrained decomposition method for DECT
 # default values - use gpus for faster 3d image processing
 cdm_args = dict(cdm_solver='gpu',
                 cdm_type='cpd',     # Compton-PE basis - default
-                projector='cpu',
+                projector='gpu',
                 init_val=(0, 0))
 # -----------------------------------------------------------------------------
 
@@ -204,4 +235,5 @@ params['images_to_save']    = ['gt', 'lac_1', 'lac_2',
                                'compton', 'pe', 'zeff']
 params['decomposer']        = decomp_method
 params['slicewise']         = False
+params['dicom_output']      = True
 # -----------------------------------------------------------------------------

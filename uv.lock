@@ -588,7 +588,7 @@ dependencies = [
     { name = "numpy" },
 ]
 wheels = [
-    { filename = "pygpufit-1.2.0-py2.py3-none-win_amd64.whl", hash = "sha256:12db3dff46401a9fbf212be6175e53efeb525584149678ca611ff8ddc47b5651" },
+    { filename = "pygpufit-1.2.0-py2.py3-none-win_amd64.whl", hash = "sha256:c8f9a1f528158ca1c92ea42b47df2cda87f919905dfd431617cb3a1d7a0d3eea" },
 ]
 
 [package.metadata]

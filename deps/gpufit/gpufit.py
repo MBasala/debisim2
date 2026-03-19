@@ -61,6 +61,7 @@ class ModelID:
     SPLINE_3D_MULTICHANNEL = 11
     SPLINE_3D_PHASE_MULTICHANNEL = 12
     COMPTON_PE = 13
+    MATERIAL_BASIS = 14
 
 
 class EstimatorID:

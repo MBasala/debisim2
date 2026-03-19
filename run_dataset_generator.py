@@ -22,49 +22,57 @@ import importlib.util as config_loader
 from src.debisim_dataset_generator import *
 
 
-parser = argparse.ArgumentParser(
-                description='Dataset Generator for DEBISim: \n'
-                            '-----------\n'
-                            'The script generates a simulated CT dataset'
-                            ' of randomized baggage configurations. '
-                            'The simulation parameters are specified using '
-                            'a config.py file - these include setting up '
-                            'the scanner + X-ray source/detector, '
-                            'the types of objects of objects to be spawned '
-                            'in the bag as well as the DE decomposition '
-                            '+ reconstruction parameters.'
-                            'Examples of config.py files are provided in '
-                            'configs/ directory for different scanners '
-                            'and scanner geometries')
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+                    description='Dataset Generator for DEBISim: \n'
+                                '-----------\n'
+                                'The script generates a simulated CT dataset'
+                                ' of randomized baggage configurations. '
+                                'The simulation parameters are specified using '
+                                'a config.py file - these include setting up '
+                                'the scanner + X-ray source/detector, '
+                                'the types of objects of objects to be spawned '
+                                'in the bag as well as the DE decomposition '
+                                '+ reconstruction parameters.'
+                                'Examples of config.py files are provided in '
+                                'configs/ directory for different scanners '
+                                'and scanner geometries')
 
-parser.add_argument('--config',
-                    default=os.path.join(CONFIG_DIR,
-                                         'config_default_parallelbeam_2d.py'),
-                    help='config file location',
-                    dest='config'
-                    )
+    parser.add_argument('--config',
+                        default=os.path.join(CONFIG_DIR,
+                                             'config_default_parallelbeam_2d.py'),
+                        help='config file location',
+                        dest='config'
+                        )
 
-parser.add_argument('--sim_dir',
-                    default=os.path.join(RESULTS_DIR,
-                                         'example_default_parallelbeam_2d/'),
-                    help='simulation directory for saving output'
-                    )
+    parser.add_argument('--sim_dir',
+                        default=os.path.join(RESULTS_DIR,
+                                             'example_default_parallelbeam_2d/'),
+                        help='simulation directory for saving output'
+                        )
 
-parser.add_argument('--num_bags',
-                    default=1,
-                    help='number of bags to simulate',
-                    type=int
-                    )
+    parser.add_argument('--num_bags',
+                        default=1,
+                        help='number of bags to simulate',
+                        type=int
+                        )
 
-args = parser.parse_args()
+    parser.add_argument('--num_workers',
+                        default=1,
+                        help='number of parallel worker processes (default: 1 = sequential)',
+                        type=int
+                        )
 
-spec = config_loader.spec_from_file_location("config.params",
-                                             args.config)
-config = config_loader.module_from_spec(spec)
-spec.loader.exec_module(config)
+    args = parser.parse_args()
 
-config.params['sim_dir'] = args.sim_dir
+    spec = config_loader.spec_from_file_location("config.params",
+                                                 args.config)
+    config = config_loader.module_from_spec(spec)
+    spec.loader.exec_module(config)
 
-config.params['num_bags'] = range(1, args.num_bags+1)
-run_xray_dataset_generator(**config.params)
+    config.params['sim_dir'] = args.sim_dir
+
+    config.params['num_bags'] = range(1, args.num_bags+1)
+    config.params['num_workers'] = args.num_workers
+    run_xray_dataset_generator(**config.params)
 # ----------------------------------------------------------------------------

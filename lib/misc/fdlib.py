@@ -471,7 +471,7 @@ class wrapped_astra_projector(object):
         self.shape = (
             proj_geom['DetectorCount'] * len(proj_geom['ProjectionAngles']),
             vol_geom['GridColCount'] * vol_geom['GridRowCount'])
-        self.dtype = np.float
+        self.dtype = float
 
     def matvec(self, v):
         sid, s = astra.create_sino(np.reshape(v, (

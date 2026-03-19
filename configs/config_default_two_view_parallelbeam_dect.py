@@ -99,6 +99,7 @@ custom_objects = [os.path.join(CUSTOM_SHAPES_DIR, s)
 
 # STL object pool configuration ------------------------------------------------
 stl_pool_config = dict(
+    use_stl_bag=True,               # always use a random STL bag boundary
     bags=dict(
         pool=discover_pool(STL_BAGS_DIR),
         materials=['neoprene', 'nylon6'],
@@ -107,24 +108,28 @@ stl_pool_config = dict(
     threats=dict(
         firearms=dict(
             pool=discover_pool(STL_FIREARMS_DIR),
+            spawn_prob=0.5,         # 50% chance firearms appear in a bag
             count_range=(0, 2),
             materials=['Fe', 'Al'],
             material_pdf=[0.7, 0.3],
         ),
         sharp_objects=dict(
             pool=discover_pool(STL_SHARP_DIR),
+            spawn_prob=0.5,         # 50% chance sharp objects appear
             count_range=(0, 2),
             materials=['Fe', 'Ti'],
             material_pdf=[0.6, 0.4],
         ),
         explosives=dict(
             pool=discover_pool(STL_EXPLOSIVES_DIR),
+            spawn_prob=0.3,         # 30% chance explosives appear
             count_range=(0, 1),
             materials=['ethanol', 'acetal', 'acrylic'],
             material_pdf=[0.4, 0.3, 0.3],
         ),
         other=dict(
             pool=discover_pool(STL_OTHER_THREATS_DIR),
+            spawn_prob=0.3,         # 30% chance other threats appear
             count_range=(0, 1),
             materials=['acetal', 'bakelite'],
             material_pdf=[0.5, 0.5],
@@ -144,7 +149,14 @@ stl_pool_config = dict(
         liquid_materials=['water'],
         liquid_material_pdf=[1.0],
     ),
-    voxel_resolution=64,
+    # mm_per_voxel: real-world size of each scene voxel.
+    # STL files are assumed to be modelled in mm; their native dimensions
+    # are preserved in the scene grid.
+    mm_per_voxel=1.0,
+    # mesh_units: unit system of the STL files.
+    # Most 3D modelling tools export in metres by default.
+    # Supported: 'mm', 'cm', 'in'/'inches', 'm'/'meters'
+    mesh_units='m',
 )
 # ------------------------------------------------------------------------------
 
@@ -174,6 +186,13 @@ bag_creator_args = dict(
     # -------------------------------------------------------------------------
     # STL object pool configuration
     stl_pool_config=stl_pool_config,
+    # overlap prevention — when True, objects are laterally shifted during
+    # placement so that most objects do not overlap each other
+    prevent_overlap=True,
+    # stl_only — when True, only STL pool objects are spawned (threats,
+    # fillers, liquid containers); random primitive shapes (ellipsoids,
+    # boxes, cylinders, cones, sheets, custom meshes) are disabled
+    stl_only=False,
     # -------------------------------------------------------------------------
 )
 # -----------------------------------------------------------------------------
@@ -211,4 +230,5 @@ params['images_to_save']    = ['gt', 'lac_1', 'lac_2',
 params['decomposer']        = decomp_method
 params['slicewise']         = False
 params['fwd_mdl_args']      = fwd_mdl_args
+params['dicom_output']      = True
 # -----------------------------------------------------------------------------
