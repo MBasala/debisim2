@@ -5,9 +5,9 @@
 #   Stage 1 (gpufit-builder): compile gpufit from source with CUDA
 #   Stage 2 (runtime): slim CUDA runtime image with Python + all deps
 #
-# Usage (from project root):
-#   cd docker && docker compose build
-#   docker compose run debisim2 --config configs/config_calibration_phantom_dect.py
+# Usage (from docker/ directory):
+#   docker compose build
+#   docker compose run debisim2p5 --config configs/config_calibration_phantom_dect.py
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
@@ -34,27 +34,27 @@ RUN cmake /build/src \
 # Build only Gpufit target (skip Cpufit)
 RUN cmake --build . --target Gpufit --parallel $(nproc)
 
-# Copy built .so into the pygpufit package directory (setup.py
-# uses package_data to include *.so from pygpufit/)
+# Copy built .so into pygpufit package dir and build wheel
 RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ && \
     cd /build/src/Gpufit/python && \
     python3 -m pip wheel . --no-deps -w /wheels/
 
 # ---- Stage 2: Runtime image -----------------------------------------------
-FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
+FROM nvidia/cuda:13.1.0-base-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# System dependencies
+# Create non-root user FIRST (before any COPY --chown)
+RUN useradd -m -s /bin/bash debisim
+
+# System dependencies (minimal — no -dev packages)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv python3-pip \
-        libgomp1 \
+        libgomp1 libcublas-13-1 libcusparse-13-1 \
         && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
 
-# Create non-root user
-RUN useradd -m -s /bin/bash debisim
 WORKDIR /app
 
 # Install uv binary directly (avoids PEP 668 restriction)
@@ -63,20 +63,15 @@ RUN tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 && \
     rm /tmp/uv.tar.gz && \
     chmod +x /usr/local/bin/uv
 
-# Create venv (all deps install here, not system Python)
-RUN uv venv /app/.venv
+# Create venv owned by debisim from the start
+RUN uv venv /app/.venv && chown -R debisim:debisim /app/.venv
 ENV VIRTUAL_ENV="/app/.venv"
 ENV PATH="/app/.venv/bin:$PATH"
-
-# Copy dependency specification first (cache layer)
-COPY docker/pyproject.docker.toml /app/pyproject.toml
 
 # Copy gpufit wheel from builder stage
 COPY --from=gpufit-builder /wheels/ /tmp/wheels/
 
-# Install Python dependencies into the venv (single layer to minimize size)
-# Dropped: torchvision (unused), scikit-learn (dead import), python3.12-dev
-#          (no C extensions compiled at runtime), pytest (run tests separately)
+# Install Python dependencies (single layer, no cache)
 RUN uv pip install --no-cache \
         torch --index-url https://download.pytorch.org/whl/cu130 && \
     uv pip install --no-cache \
@@ -87,33 +82,31 @@ RUN uv pip install --no-cache \
     uv pip install --no-cache /tmp/wheels/*.whl && \
     rm -rf /tmp/wheels
 
-# Copy application code
-COPY lib/ /app/lib/
-COPY src/ /app/src/
-COPY configs/ /app/configs/
-COPY include/ /app/include/
-COPY deps/gpufit/ /app/deps/gpufit/
-COPY examples/ /app/examples/
-COPY benchmarks/ /app/benchmarks/
-COPY tests/ /app/tests/
-COPY run_dataset_generator.py /app/
+# Copy application code — all owned by debisim (no chown layer needed)
+COPY --chown=debisim:debisim lib/ /app/lib/
+COPY --chown=debisim:debisim src/ /app/src/
+COPY --chown=debisim:debisim configs/ /app/configs/
+COPY --chown=debisim:debisim include/ /app/include/
+COPY --chown=debisim:debisim deps/gpufit/ /app/deps/gpufit/
+COPY --chown=debisim:debisim examples/ /app/examples/
+COPY --chown=debisim:debisim benchmarks/ /app/benchmarks/
+COPY --chown=debisim:debisim tests/ /app/tests/
+COPY --chown=debisim:debisim run_dataset_generator.py /app/
 
-# Default results directory
-RUN mkdir -p /app/results && chown -R debisim:debisim /app
+# Results directory
+RUN mkdir -p /app/results && chown debisim:debisim /app/results
 
 # Switch to non-root user
 USER debisim
 
-# Ensure venv is on PATH for non-root user
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app"
 ENV PYTHONUNBUFFERED=1
 
-# Health check — verify imports work
+# Health check
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "from src.debisim_pipeline import DEBISimPipeline; print('OK')"
 
-# Default entrypoint runs the dataset generator
 ENTRYPOINT ["python", "run_dataset_generator.py"]
 CMD ["--config", "configs/config_calibration_phantom_dect.py", \
      "--sim_dir", "results/calibration_phantom/", \
