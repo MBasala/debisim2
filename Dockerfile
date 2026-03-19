@@ -55,7 +55,7 @@ RUN useradd -m -s /bin/bash debisim
 WORKDIR /app
 
 # Install uv binary directly (avoids PEP 668 restriction, no curl needed)
-ADD https://astral.sh/uv/0.6.14/uv-x86_64-unknown-linux-gnu.tar.gz /tmp/uv.tar.gz
+ADD https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz /tmp/uv.tar.gz
 RUN tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 && \
     rm /tmp/uv.tar.gz && \
     chmod +x /usr/local/bin/uv
