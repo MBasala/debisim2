@@ -54,10 +54,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -s /bin/bash debisim
 WORKDIR /app
 
-# Install uv via standalone installer (avoids PEP 668 restriction)
-ADD https://astral.sh/uv/install.sh /tmp/uv-install.sh
-RUN sh /tmp/uv-install.sh && rm /tmp/uv-install.sh
-ENV PATH="/root/.local/bin:$PATH"
+# Install uv binary directly (avoids PEP 668 restriction, no curl needed)
+ADD https://astral.sh/uv/0.6.14/uv-x86_64-unknown-linux-gnu.tar.gz /tmp/uv.tar.gz
+RUN tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 && \
+    rm /tmp/uv.tar.gz && \
+    chmod +x /usr/local/bin/uv
 
 # Create venv first (all deps install into it, not system Python)
 RUN uv venv /app/.venv
