@@ -1373,9 +1373,17 @@ def create_parallel_scanner(gantry_diameter_mm=512,
         view_range=view_range,
         slice_thickness=pixel_size_mm,
         image_dims=(n_pixels, n_pixels, n_slices),
-        ramlak=RAMLAK_FILTER_FILE,
+        # Ram-Lak filter is generated dynamically in set_recon_geometry()
+        # based on det_col_count — no static file needed.
+        ramlak=None,
+        # img_scale compensates for the detector pixel pitch in the
+        # FBP backprojection.  Must be 1/det_spacing_y so that the
+        # reconstructed LAC values are physically correct regardless
+        # of pixel_size_mm.
         img_scale=1.0 / det_spacing_y,
-        mu_w=default_scanner_parallel.recon_params['mu_w'],
+        # mu_w=None forces the pipeline to compute water LAC from the
+        # actual X-ray spectra instead of using stale hardcoded values.
+        mu_w=None,
     )
 
     scanner = ScannerTemplate(

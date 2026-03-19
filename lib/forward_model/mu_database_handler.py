@@ -315,11 +315,13 @@ class MuDatabaseHandler(object):
                       self.elements_list[18:31] + self.elements_list[36:50] + \
                       self.elements_list[54:83] + self.elements_list[87:]
 
-        self.periodic_table = genfromtxt(fname=os.path.join(MU_DIR,
-                                                      'periodic_table.csv'),
-                                         delimiter=',', skip_header=1)
+        self.periodic_table = np.genfromtxt(
+            os.path.join(MU_DIR, 'periodic_table.csv'),
+            delimiter=',', dtype=None, encoding='utf-8',
+            names=True)    # names=True reads header row as field names
 
-        self.molar_masses = {x[2]: x[3] for x in self.periodic_table}
+        self.molar_masses = {row['Symbol']: row['AtomicMass']
+                             for row in self.periodic_table}
 
         # Load Attenuation data from the database -----------------------------
 

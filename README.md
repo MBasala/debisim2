@@ -29,7 +29,7 @@ To know more about the mechanism behind the simulator, read our supporting resea
 
 #### Requirements
 
-- Python3  (>v3.11.x)
+- Python3  (>=3.12, <3.13)
 - CUDA Toolkit (>=v12.0)
 - For GPU Support: PyTorch , pyGpufit 
 - The ASTRA toolbox
