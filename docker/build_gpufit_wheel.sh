@@ -23,9 +23,9 @@ echo "  Output: $SCRIPT_DIR"
 # Verify source exists before launching Docker
 if [ ! -d "$PROJECT_ROOT/deps/Gpufit_build" ]; then
     echo "ERROR: Gpufit_build not found at $PROJECT_ROOT/deps/Gpufit_build"
-    echo "  Trying Windows path via /mnt/c/..."
-    PROJECT_ROOT="/mnt/c/Users/MBasa/PycharmProjects/debisim2"
-    SCRIPT_DIR="$PROJECT_ROOT/docker"
+    echo "If running from WSL, cd to the /mnt/c/... path first:"
+    echo "  cd /mnt/c/path/to/debisim2/docker && bash build_gpufit_wheel.sh"
+    exit 1
 fi
 
 docker run --rm --gpus all \
