@@ -17,10 +17,13 @@ __email__     = ["amanerik@purdue.edu", "li1208@purdue.edu"]
 __status__    = "Prototype"
 # ------------------------------------------------------------------------------
 
+import builtins
 import warnings
 warnings.filterwarnings('ignore')
 from tqdm import tqdm
+import numpy as np
 from numpy import *
+from lib.misc.util import save_fits_data, save_fits_data_async, flush_async_io
 
 from torch.distributions import Poisson, Normal
 
@@ -36,7 +39,8 @@ from skimage.measure import regionprops
 from matplotlib import rcParams
 
 rcParams.update({'figure.autolayout': True})
-torch.set_default_tensor_type(torch.cuda.FloatTensor)
+if torch.cuda.is_available():
+    torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
 """-----------------------------------------------------------------------------
 * Module Description:
@@ -343,14 +347,33 @@ class DEBISimPipeline(object):
                                                  debug=self.debug
                                          )
 
-        # obtain randomized Object3D list
-        obj_list = virtual_bag_creator.create_random_object_list(
-                                            **baggage_creator_args
-                                            )
+        # obtain Object3D list — either calibration phantom or random bag
+        _bag_args = dict(baggage_creator_args)
+        prevent_overlap = _bag_args.pop('prevent_overlap', False)
+        phantom_mode = _bag_args.pop('phantom_mode', False)
 
-        # run placement logic
-        virtual_bag_creator.create_baggage_image(obj_list, 
-                                                 save_data=False)
+        if phantom_mode:
+            phantom_materials = _bag_args.pop('phantom_materials')
+            phantom_grid = _bag_args.pop('phantom_grid', (5, 5))
+            phantom_block_size = _bag_args.pop('phantom_block_size', 30)
+            phantom_gap = _bag_args.pop('phantom_gap', 20)
+
+            # Phantom places blocks directly into ws_bag and finalizes
+            # virtual_bag — no Object3D / create_baggage_image needed.
+            virtual_bag_creator.create_calibration_phantom(
+                materials=phantom_materials,
+                grid=phantom_grid,
+                block_size=phantom_block_size,
+                gap=phantom_gap,
+            )
+        else:
+            obj_list = virtual_bag_creator.create_random_object_list(
+                                                **_bag_args
+                                                )
+            # run placement logic
+            virtual_bag_creator.create_baggage_image(obj_list,
+                                                     save_data=False,
+                                                     prevent_overlap=prevent_overlap)
         sf_obj_list = virtual_bag_creator.param_file + prior_list
 
         # This is your final virtual bag
@@ -508,7 +531,8 @@ class DEBISimPipeline(object):
         self.logger.info('=' * 40)
         self.material_curve = material_curve
 
-        del obj_list
+        if 'obj_list' in dir():
+            del obj_list
         self.save_dect_ground_truth_images(images=save_images)
 
         torch.cuda.empty_cache()
@@ -643,20 +667,23 @@ class DEBISimPipeline(object):
             del voxelizer
         else:
             self.gt_image_3d = torch.as_tensor(gt_image)
-            self.compton_image_3d = torch.zeros_like(self.gt_image_3d,
-                                                     dtype=torch.float)
 
+            # Build compton image via LUT instead of per-object torch.where loop
+            _max_lbl = int(self.gt_image_3d.max().item()) + 1
+            _compton_lut = torch.zeros(_max_lbl, dtype=torch.float,
+                                       device=self.gt_image_3d.device)
             for sf_obj in sf_obj_list:
-                self.compton_image_3d = torch.where(
-                    self.gt_image_3d == sf_obj['label'],
-                    torch.Tensor([self.mu.material(sf_obj['material'], 
-                                                   'compton')]),
-                    self.compton_image_3d)
+                _compton_lut[sf_obj['label']] = self.mu.material(
+                    sf_obj['material'], 'compton')
+                if sf_obj.get('lqd_flag') and sf_obj.get('lqd_param'):
+                    _compton_lut[sf_obj['lqd_param']['lqd_label']] = \
+                        self.mu.material(sf_obj['lqd_param']['lqd_material'],
+                                         'compton')
 
-        torch.cuda.empty_cache()
+            self.compton_image_3d = _compton_lut[
+                self.gt_image_3d.long().clamp(0, _max_lbl - 1)]
 
         self.save_dect_ground_truth_images(images=save_images)
-        torch.cuda.empty_cache()
     # --------------------------------------------------------------------------
 
     def generate_polychromatic_ct_projection(self,
@@ -685,14 +712,6 @@ class DEBISimPipeline(object):
         """
 
         t0 = time.time()
-        torch.cuda.empty_cache()
-
-        projection_buffer = torch.zeros(
-            self.scanner_geometry['det_row_count'],
-            self.reconstruction_geometry['n_views'],
-            self.scanner_geometry['det_col_count'],
-            dtype=torch.float
-        )
 
         i = spectrum
         self.logger.info("Generating Polyenergetic Sinograms "
@@ -701,68 +720,193 @@ class DEBISimPipeline(object):
         curr_spectrum =  loadtxt(self.xray_source_model['spectra'][i-1])[:, 1]
         curr_pc = self.xray_source_model['dosage'][i-1]
 
-        torch.cuda.empty_cache()
-
         material_list = unique(list(self.material_curve.keys()))
         pc_sum = 0
 
-        # self.keV_range = range(50,53)
+        # --- Build label-to-material index map on CPU (numpy) -------------------
+        # The ref_image for each keV is assembled via numpy LUT indexing and
+        # passed to ASTRA (which runs its own GPU kernels).  Keeping this on
+        # CPU means torch doesn't hog VRAM while ASTRA needs it.
+        mat_indices = {mat: idx for idx, mat in enumerate(material_list)}
+        max_label = int(self.gt_image_3d.max().item()) + 1
 
-        kev_iter = tqdm(self.keV_range[:curr_spectrum.size])
+        _label_to_mat_idx = np.full(max_label, -1, dtype=np.int32)
+        for sf_obj in self.sf_obj_list:
+            mat = sf_obj['material']
+            if mat in mat_indices:
+                _label_to_mat_idx[sf_obj['label']] = mat_indices[mat]
+            if sf_obj.get('lqd_flag') and sf_obj.get('lqd_param'):
+                lqd_mat = sf_obj['lqd_param']['lqd_material']
+                if lqd_mat in mat_indices:
+                    _label_to_mat_idx[sf_obj['lqd_param']['lqd_label']] = \
+                        mat_indices[lqd_mat]
 
+        # ---- Build LUT + index maps on BOTH CPU and GPU ----------------------
+        # CPU RAM is plentiful (64 GB) so we duplicate the index map:
+        #   - CPU copy:  feeds ASTRA via np.take (no GPU→CPU transfer per keV)
+        #   - GPU copy:  feeds torch post-processing (exp, noise, accumulate)
+        # The LUT itself is tiny (n_mats × n_keV ≈ 7 KB).
+        _gt_device = self.gt_image_3d.device
+
+        _label_to_mat_idx_gpu = torch.tensor(
+            _label_to_mat_idx, dtype=torch.long, device=_gt_device)
+        gt_clamped = self.gt_image_3d.long().clamp(0, max_label - 1)
+        voxel_mat_idx_gpu = _label_to_mat_idx_gpu[gt_clamped]
+        del gt_clamped, _label_to_mat_idx_gpu
+
+        bg_mask_gpu = (voxel_mat_idx_gpu < 0)
+        voxel_mat_idx_safe_gpu = voxel_mat_idx_gpu.clamp(min=0)
+        del voxel_mat_idx_gpu
+
+        # CPU copies for ASTRA (duplicated — CPU RAM is cheap)
+        voxel_mat_idx_safe_cpu = voxel_mat_idx_safe_gpu.cpu().numpy()
+        bg_mask_cpu = bg_mask_gpu.cpu().numpy()
+
+        # Pre-build per-keV LAC lookup table on both CPU and GPU
+        n_kev = len(self.keV_range[:curr_spectrum.size])
+        n_mats = len(material_list)
+        lac_lut_cpu = np.zeros((n_mats, n_kev), dtype=np.float32)
+        for mat in material_list:
+            idx = mat_indices[mat]
+            for ki in range(n_kev):
+                lac_lut_cpu[idx, ki] = self.material_curve[mat][ki]
+        lac_lut_gpu = torch.tensor(lac_lut_cpu, device=_gt_device)
+
+        # Pre-allocate reusable CPU buffer for ASTRA input (avoids alloc per keV)
+        ref_image_cpu = np.empty(voxel_mat_idx_safe_cpu.shape, dtype=np.float32)
+
+        # ---- Temporarily move large tensors off GPU --------------------------
+        # gt_image_3d and compton_image_3d are ~2 GB each on a 1024×1024
+        # volume.  They're no longer needed until after the energy loop.
+        # GPU now holds: voxel_mat_idx_safe_gpu (~350 MB) + bg_mask_gpu (~90 MB)
+        #              + lac_lut_gpu (~7 KB) + projection_buffer (~130 MB)
+        #              ≈ 570 MB, leaving ~11 GB for ASTRA.
+        self.gt_image_3d = self.gt_image_3d.cpu()
+        self.compton_image_3d = self.compton_image_3d.cpu()
+        if hasattr(self, 'pe_image_3d') and torch.is_tensor(self.pe_image_3d):
+            self.pe_image_3d = self.pe_image_3d.cpu()
+        if hasattr(self, 'zeff_image_3d') and torch.is_tensor(self.zeff_image_3d):
+            self.zeff_image_3d = self.zeff_image_3d.cpu()
+
+        # The energy loop uses CPU copies for ASTRA, so free the GPU
+        # index/mask tensors too — they were only needed to build the CPU copies.
+        del voxel_mat_idx_safe_gpu, bg_mask_gpu, lac_lut_gpu
+
+        # Free torch's cached GPU memory so ASTRA can use the full VRAM.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            try:
+                _free, _total = torch.cuda.mem_get_info(0)
+                astra.set_gpu_index(0, memory=int(_free * 0.9))
+                self.logger.info(
+                    f"ASTRA GPU memory: {_free/1e9:.1f} GB free of "
+                    f"{_total/1e9:.1f} GB total")
+            except Exception:
+                try:
+                    astra.set_gpu_index(0)
+                except Exception:
+                    pass
+        # --------------------------------------------------------------------------
+
+        # Accumulation buffer on GPU — post-processing (exp, noise) runs on GPU.
+        proj_shape = (self.scanner_geometry['det_row_count'],
+                      self.reconstruction_geometry['n_views'],
+                      self.scanner_geometry['det_col_count'])
+        projection_buffer_gpu = torch.zeros(proj_shape, dtype=torch.float32,
+                                            device=_gt_device)
+
+        # ---- Pre-compute ref_images into RAM (budget-aware) ------------------
+        # Pre-computing eliminates per-keV CPU LUT work.  We cap the batch
+        # to fit in available RAM (leaves 8 GB headroom for OS / other use).
+        import psutil
+        vol_shape = voxel_mat_idx_safe_cpu.shape
+        n_kev_total = len(self.keV_range[:curr_spectrum.size])
+        bytes_per_image = int(np.prod(vol_shape)) * 4  # float32
+
+        avail_ram = psutil.virtual_memory().available
+        ram_budget = builtins.max(0, avail_ram - 8 * 1024**3)  # keep 8 GB free
+        batch_size = builtins.min(n_kev_total,
+                                  builtins.max(1, int(ram_budget // bytes_per_image)))
+
+        self.logger.info(
+            f"Pre-computing ref_images: {batch_size}/{n_kev_total} keV per batch "
+            f"({batch_size * bytes_per_image / 1e9:.1f} GB, "
+            f"{avail_ram / 1e9:.1f} GB available)")
+
+        # Pre-allocate the batch buffer + a single fallback buffer
+        precomp_buf = np.empty((batch_size, *vol_shape), dtype=np.float32)
+        ref_image_cpu = np.empty(vol_shape, dtype=np.float32)
+
+        kev_list = list(self.keV_range[:curr_spectrum.size])
+        kev_iter = tqdm(kev_list)
+
+        # Process in batches (init to -batch_size so the first iteration
+        # triggers a fill)
+        batch_start = -batch_size
         for e in kev_iter:
             k = e - self.keV_range[0]
-            t1 = time.time()
-            ref_image = torch.zeros_like(self.compton_image_3d)
-            kev_iter.set_description(f"Processing Energy Level, {e} keV:\t", refresh=True)
 
-            for mat in material_list:
+            # Fill the next batch if needed
+            if k >= batch_start + batch_size or k < batch_start:
+                batch_start = k
+                batch_end = builtins.min(batch_start + batch_size, n_kev_total)
+                for bi in range(batch_start, batch_end):
+                    np.take(lac_lut_cpu[:, bi], voxel_mat_idx_safe_cpu,
+                            out=precomp_buf[bi - batch_start])
+                    precomp_buf[bi - batch_start][bg_mask_cpu] = 0.0
 
-                ref_image = torch.where(self.compton_image_3d==self.mu.material(mat,
-                                                                                'compton'),
-                                        torch.Tensor([self.material_curve[mat][k]]),
-                                        ref_image)
-                torch.cuda.empty_cache()
+            # --- ASTRA GPU — forward projection (just an index into batch) ----
+            proj_np = self.scanner.run_fwd_projector(
+                precomp_buf[k - batch_start])
 
-            curr_projection = self.scanner.projn_generator(ref_image)
-            curr_projection = torch.mul(curr_projection, curr_pc)
-            curr_projection = torch.mul(curr_projection, curr_spectrum[e-10]*system_gain*e)
+            # --- torch GPU — Beer-Lambert + noise + accumulate ----------------
+            curr = torch.as_tensor(proj_np, device=_gt_device)
+            del proj_np
+
+            scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
+            curr.neg_()
+            curr.exp_()
+            curr.mul_(scale)
 
             if add_poisson_noise:
-                poisson_sampler = Poisson(curr_projection.type(torch.float))
-                curr_projection = poisson_sampler.sample()
-                del poisson_sampler
-                torch.cuda.empty_cache()
-
-            curr_projection = torch.as_tensor(curr_projection,
-                                              dtype=torch.float)
+                curr.clamp_(min=0.0)
+                curr = torch.poisson(curr)
 
             if add_system_noise:
+                curr.add_(torch.randn_like(curr), alpha=shot_gain)
 
-                mask = torch.ones_like(curr_projection)
-                g_noise = torch.normal(0.0, mask)
-                g_noise = torch.mul(g_noise, shot_gain)
-                curr_projection = torch.add(curr_projection, g_noise)
-                del g_noise, mask
-                torch.cuda.empty_cache()
+            projection_buffer_gpu.add_(curr)
+            del curr
+            pc_sum += scale
 
-            projection_buffer = torch.add(curr_projection, projection_buffer)
+            kev_iter.set_description(
+                f"Processing Energy Level, {e} keV:\t", refresh=True)
 
-            del curr_projection
-            torch.cuda.empty_cache()
-            pc_sum += curr_pc*curr_spectrum[e-10]*system_gain*e
+        del precomp_buf, ref_image_cpu
+        del voxel_mat_idx_safe_cpu, bg_mask_cpu, lac_lut_cpu
 
-        projection_buffer = torch.where(projection_buffer<1,
-                                        torch.Tensor([1.0]), projection_buffer)
-        projection_buffer = torch.log(projection_buffer)
-        projection_buffer = torch.neg(projection_buffer)
-        projection_buffer = torch.add(projection_buffer,  log(pc_sum))
-        projection_buffer = projection_buffer.cpu().numpy()
-        torch.cuda.empty_cache()
+        # Free ASTRA's cached GPU objects now that the energy sweep is done
+        self.scanner.cleanup_astra_cache()
+
+        # Restore large tensors to GPU for downstream stages (decomposer, etc.)
+        self.gt_image_3d = self.gt_image_3d.to(_gt_device)
+        self.compton_image_3d = self.compton_image_3d.to(_gt_device)
+        if hasattr(self, 'pe_image_3d') and torch.is_tensor(self.pe_image_3d):
+            self.pe_image_3d = self.pe_image_3d.to(_gt_device)
+        if hasattr(self, 'zeff_image_3d') and torch.is_tensor(self.zeff_image_3d):
+            self.zeff_image_3d = self.zeff_image_3d.to(_gt_device)
+
+        # Convert accumulated projection to log-attenuation sinogram (on GPU)
+        projection_buffer_gpu.clamp_(min=1.0)
+        projection_buffer_gpu.log_()
+        projection_buffer_gpu.neg_()
+        projection_buffer_gpu.add_(log(pc_sum))
+        projection_buffer = projection_buffer_gpu.cpu().numpy()
+        del projection_buffer_gpu
 
         self.logger.info("Sinogram Created ...")
 
-        save_fits_data(self.f_loc['sino_file']%spectrum,
+        save_fits_data_async(self.f_loc['sino_file']%spectrum,
                        projection_buffer,
                        self.compress_data)
         
@@ -856,10 +1000,11 @@ class DEBISimPipeline(object):
 
         projn = projn + scatter_projn.T
 
-        s_projn = torch.as_tensor(projn, dtype=torch.float, device='cuda')
+        _device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        s_projn = torch.as_tensor(projn, dtype=torch.float, device=_device)
 
         s_projn = torch.where(s_projn<1,
-                              torch.Tensor([1.0]), s_projn)
+                              torch.tensor(1.0, device=_device), s_projn)
         s_projn = torch.log(s_projn)
         s_projn = torch.neg(s_projn)
         s_projn = torch.add(s_projn,  log(pc_sum))
@@ -951,6 +1096,9 @@ class DEBISimPipeline(object):
 
         self.logger.info("Xray data generated")
         self.logger.info("=" * 80)
+
+        # Ensure all async sinogram writes are finished before reading back
+        flush_async_io()
 
         # Load the generated projection data
         if self.xray_source_model['num_spectra']==2:
@@ -1193,7 +1341,7 @@ class DEBISimPipeline(object):
 
             self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
                                                     'sino_%i.fits.gz')
-            save_fits_data(self.f_loc['sino_file'] % 1,
+            save_fits_data_async(self.f_loc['sino_file'] % 1,
                            self.data,
                            self.compress_data)
 
@@ -1220,12 +1368,12 @@ class DEBISimPipeline(object):
                                     data2[:, s::bag_params['n_seqs'], :]
 
             self.f_loc['sino_file'] = 'sino_%i.fits.gz'
-            save_fits_data(self.f_loc['sino_file'] % 1, self.data1, self.compress_data)
+            save_fits_data_async(self.f_loc['sino_file'] % 1, self.data1, self.compress_data)
 
             self.data1 = moveaxis(self.data1, -1, 0)
             self.data1 = self.data1[:, :, ::-1]
 
-            save_fits_data(self.f_loc['sino_file'] % 2, self.data2, self.compress_data)
+            save_fits_data_async(self.f_loc['sino_file'] % 2, self.data2, self.compress_data)
 
             self.data2 = moveaxis(self.data2, -1, 0)
             self.data2 = self.data2[:, :, ::-1]
@@ -1405,11 +1553,13 @@ class DEBISimPipeline(object):
 
             if self.xray_source_model['num_spectra'] == 2:
 
-                if self.scanner.machine_geometry['scanner_name'] == 'default_parallelbeam':
-                    image_1 = moveaxis(image_1.copy(), 0, -1)
-                    image_2 = moveaxis(image_2.copy(), 0, -1)
-                    image_1 = image_1[::-1,:,:].copy()
-                    image_2 = image_2[::-1,:,:].copy()
+                if self.scanner.machine_geometry['scanner_name'] in (
+                        'default_parallelbeam', 'parallel_custom'):
+                    # Single contiguous copy: moveaxis + flip in one step
+                    image_1 = np.ascontiguousarray(
+                        moveaxis(image_1, 0, -1)[::-1, :, :])
+                    image_2 = np.ascontiguousarray(
+                        moveaxis(image_2, 0, -1)[::-1, :, :])
 
                 image_1 *= scale
                 image_1 = (image_1 - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
@@ -1419,7 +1569,7 @@ class DEBISimPipeline(object):
                                          self.f_loc['img_file'] % 1)
                 self.logger.info("Saving results to: "+out_fname)
 
-                save_fits_data(out_fname, image_1, self.compress_data)
+                save_fits_data_async(out_fname, image_1, self.compress_data)
 
                 image_2 *= scale
                 image_2 = (image_2 - mu_w['lac_2']) / mu_w['lac_2'] * 1000 + offset
@@ -1429,7 +1579,10 @@ class DEBISimPipeline(object):
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'] % 2)
                 self.logger.info("Saving results to: "+out_fname)
-                save_fits_data(out_fname, image_2, self.compress_data)
+                save_fits_data_async(out_fname, image_2, self.compress_data)
+
+                # Cache in memory so save_dicom_output() doesn't re-read from disk
+                self._recon_images_cache = [image_1, image_2]
 
                 create_gif(os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
                            self.gt_image_3d.cpu().numpy(),
@@ -1452,14 +1605,15 @@ class DEBISimPipeline(object):
                 image_1 = (image_1 - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
                 image_1 = clip(image_1, cmin, cmax).astype(np.int16)
 
-                if self.scanner.machine_geometry['scanner_name'] == 'default_parallelbeam':
-                    image_1 = moveaxis(image_1.copy(), 0, -1)
-                    image_1 = image_1[::-1,:,:].copy()
+                if self.scanner.machine_geometry['scanner_name'] in (
+                        'default_parallelbeam', 'parallel_custom'):
+                    image_1 = np.ascontiguousarray(
+                        moveaxis(image_1, 0, -1)[::-1, :, :])
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file']%1)
                 self.logger.info("Saving results to: "+out_fname)
-                save_fits_data(out_fname, image_1, self.compress_data)
+                save_fits_data_async(out_fname, image_1, self.compress_data)
                 create_gif(os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
                            self.gt_image_3d.cpu().numpy(),
                            stride=5)
@@ -1475,21 +1629,35 @@ class DEBISimPipeline(object):
                     self.logger.info("Plotted Baggage Statistics")
 
             if self.DECOMPOSER_FLAG:
-                if self.scanner.machine_geometry['scanner_name'] == 'default_parallelbeam':
-                    image_c = moveaxis(image_c.copy(), 0, -1)
-                    image_pe = moveaxis(image_pe.copy(), 0, -1)
-                    image_z = moveaxis(image_z.copy(), 0, -1)
-                    image_c = image_c[::-1,:,:].copy()
-                    image_pe = image_pe[::-1,:,:].copy()
-                    image_z = image_z[::-1,:,:].copy()
+                if self.scanner.machine_geometry['scanner_name'] in (
+                        'default_parallelbeam', 'parallel_custom'):
+                    image_c = np.ascontiguousarray(
+                        moveaxis(image_c, 0, -1)[::-1, :, :])
+                    image_pe = np.ascontiguousarray(
+                        moveaxis(image_pe, 0, -1)[::-1, :, :])
+                    image_z = np.ascontiguousarray(
+                        moveaxis(image_z, 0, -1)[::-1, :, :])
 
                 image_c *= scale
                 image_pe *= scale
                 image_c = (image_c - mu_w['compton'])/mu_w['compton']*1000 + offset
                 image_pe = (image_pe - mu_w['pe'])/mu_w['pe']*1000 + offset
                 image_z = (image_z - mu_w['z'])/mu_w['z']*1000 + offset
-                image_z[image_1 < cmin+200] = cmin
-                image_z[image_2 < cmin+200] = cmin
+                # Ensure image_z and image_1/2 have matching shapes before
+                # boolean indexing (they can differ if the decomposer
+                # sinogram shape differs from the LAC sinogram shape).
+                if image_z.shape != image_1.shape:
+                    # Crop or pad to the minimum common shape
+                    common = tuple(builtins.min(a, b) for a, b in
+                                   zip(image_z.shape, image_1.shape))
+                    image_z = image_z[:common[0], :common[1], :common[2]]
+                    image_1_crop = image_1[:common[0], :common[1], :common[2]]
+                    image_2_crop = image_2[:common[0], :common[1], :common[2]]
+                    image_z[image_1_crop < cmin + 200] = cmin
+                    image_z[image_2_crop < cmin + 200] = cmin
+                else:
+                    image_z[image_1 < cmin+200] = cmin
+                    image_z[image_2 < cmin+200] = cmin
                 image_c  = clip(image_c,  cmin, cmax).astype(np.int16)
                 image_pe = clip(image_pe, cmin, cmax).astype(np.int16)
                 image_z  = clip(image_z,  cmin, cmax).astype(np.int16)
@@ -1497,17 +1665,17 @@ class DEBISimPipeline(object):
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % img_suffixes[0])
                 self.logger.info("Saving results to: "+out_fname)
-                save_fits_data(out_fname, image_c, self.compress_data)
+                save_fits_data_async(out_fname, image_c, self.compress_data)
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % img_suffixes[1])
                 self.logger.info("Saving results to: "+out_fname)
-                save_fits_data(out_fname, image_pe, self.compress_data)
+                save_fits_data_async(out_fname, image_pe, self.compress_data)
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % 'z')
                 self.logger.info("Saving results to: "+out_fname)
-                save_fits_data(out_fname, image_z, self.compress_data)
+                save_fits_data_async(out_fname, image_z, self.compress_data)
 
                 del image_c, image_pe, image_z, image_1, image_2
 
@@ -1520,7 +1688,93 @@ class DEBISimPipeline(object):
                     out_fname = os.path.join(self.f_loc['image_dir'],
                                              'recon_image_%s.fits.gz' % 'rho')
                     self.logger.info("Saving results to: "+out_fname)
-                    save_fits_data(out_fname, image_rho, self.compress_data)
+                    save_fits_data_async(out_fname, image_rho, self.compress_data)
+
+            # Wait for all async FITS writes to complete before exiting
+            flush_async_io()
+            self.logger.info("All FITS files saved.")
+    # --------------------------------------------------------------------------
+
+    def save_dicom_output(self):
+        """
+        Save reconstructed images as DICOM CT series and create an RT-Struct
+        with threat ROI contours. Each series folder is named with its kV.
+        """
+        from lib.misc.util import save_dicom_output as _save_dicom
+
+        # Extract per-spectrum kV from spectra filenames or kVp field
+        num_spectra = self.xray_source_model['num_spectra']
+        spectra_paths = self.xray_source_model.get('spectra', [])
+        kvp = self.xray_source_model.get('kVp', None)
+
+        kv_labels = []
+        for s in range(num_spectra):
+            if s < len(spectra_paths):
+                # Try to extract kV from filename like 'example_spectrum_130kV.txt'
+                import re
+                match = re.search(r'(\d+)\s*[kK][vV]', os.path.basename(spectra_paths[s]))
+                if match:
+                    kv_labels.append(f'{match.group(1)}kV')
+                    continue
+            # Fallback: use kVp field or index
+            if kvp is not None:
+                kv_labels.append(f'{kvp}kV')
+            else:
+                kv_labels.append(f'spectrum_{s+1}')
+
+        # Use cached reconstructed images if available (avoids FITS re-read)
+        recon_images = {}
+        cached = getattr(self, '_recon_images_cache', None)
+        if cached is not None:
+            for s in range(builtins.min(num_spectra, len(cached))):
+                recon_images[kv_labels[s]] = cached[s]
+            del self._recon_images_cache
+        else:
+            # Fallback: re-read from FITS files
+            for s in range(1, num_spectra + 1):
+                fpath = os.path.join(self.f_loc['image_dir'],
+                                     self.f_loc['img_file'] % s)
+                if os.path.exists(fpath):
+                    recon_images[kv_labels[s - 1]] = read_fits_data(fpath, 0)
+
+        gt_label = self.gt_image_3d
+        if hasattr(gt_label, 'cpu'):
+            gt_label = gt_label.cpu().numpy()
+        gt_label = gt_label.astype(np.int16)
+
+        # Build scan metadata from scanner and source model
+        mg = self.scanner_geometry
+        dosage_list = self.xray_source_model.get('dosage', [])
+        scan_metadata = dict(
+            scanner_name=mg.get('scanner_name', 'DEBISim2'),
+            geometry=self.scanner.geom,
+            scan_type=self.scanner.scan,
+            source_origin=mg.get('source_origin', ''),
+            origin_det=mg.get('origin_det', ''),
+            det_row_count=mg.get('det_row_count', ''),
+            det_col_count=mg.get('det_col_count', ''),
+            sens_spacing_x=mg.get('sens_spacing_x', ''),
+            sens_spacing_y=mg.get('sens_spacing_y', ''),
+            gantry_diameter=mg.get('gantry_diameter', ''),
+            anode_angle=mg.get('anode_angle', ''),
+            num_views=mg.get('num_views', ''),
+            kVp=kvp if kvp is not None else '',
+            dosage=dosage_list[0] if len(dosage_list) > 0 else '',
+            recon_algo=self.scanner.recon,
+            image_dims=self.scanner.recon_params.get('image_dims', []),
+            fov=mg.get('gantry_diameter', ''),
+        )
+
+        _save_dicom(
+            image_dir=self.f_loc['image_dir'],
+            recon_images=recon_images,
+            gt_label_volume=gt_label,
+            sf_obj_list=self.sf_obj_list,
+            scan_metadata=scan_metadata,
+            mu_handler=self.mu,
+        )
+        self.logger.info("DICOM output with threat ROIs saved to %s" %
+                         os.path.join(self.f_loc['image_dir'], 'dicom'))
     # --------------------------------------------------------------------------
 
     def save_dect_ground_truth_images(self, images=['gt']):
@@ -1535,7 +1789,7 @@ class DEBISimPipeline(object):
         """
 
         if 'gt' in images:
-            save_fits_data(self.f_loc['gt_image'],
+            save_fits_data_async(self.f_loc['gt_image'],
                            self.gt_image_3d.cpu().numpy().astype(int16), self.compress_data)
 
             self.logger.info("GT image saved as %s"%self.f_loc['gt_image'])
@@ -1544,7 +1798,7 @@ class DEBISimPipeline(object):
             compton_image_file = os.path.join(self.f_loc['gt_dir'],
                                               'gt_compton_image.fits.gz')
 
-            save_fits_data(compton_image_file,
+            save_fits_data_async(compton_image_file,
                            self.compton_image_3d.cpu().numpy(), self.compress_data)
 
             self.logger.info("Compton image saved as %s"%compton_image_file)
@@ -1568,11 +1822,8 @@ class DEBISimPipeline(object):
                                                                                 'pe')]),
                                                  pe_image_3d)
 
-            save_fits_data(pe_image_file, pe_image_3d.cpu().numpy(), self.compress_data)
-
+            save_fits_data_async(pe_image_file, pe_image_3d.cpu().numpy(), self.compress_data)
             del pe_image_3d
-            torch.cuda.empty_cache()
-
             self.logger.info("PE image saved as %s"%pe_image_file)
 
         if 'zeff' in images:
@@ -1594,11 +1845,8 @@ class DEBISimPipeline(object):
                                                                                 'z')]),
                                                  zeff_image_3d)
 
-            save_fits_data(zeff_image_file, zeff_image_3d.cpu().numpy(), self.compress_data)
-
+            save_fits_data_async(zeff_image_file, zeff_image_3d.cpu().numpy(), self.compress_data)
             del zeff_image_3d
-
-            torch.cuda.empty_cache()
             self.logger.info("Zeff image saved as %s"%zeff_image_file)
 
         if 'lac' in images:
@@ -1619,11 +1867,8 @@ class DEBISimPipeline(object):
                                                                                 'lac')]),
                                                  lac_1_image_3d)
 
-            save_fits_data(lac_image_file, lac_image_3d.cpu().numpy(), self.compress_data)
-
+            save_fits_data_async(lac_image_file, lac_image_3d.cpu().numpy(), self.compress_data)
             del lac_image_3d
-
-            torch.cuda.empty_cache()
             self.logger.info("LAC image saved as %s"%lac_image_file)
 
         if 'lac_1' in images:
@@ -1645,11 +1890,8 @@ class DEBISimPipeline(object):
                                                                                 'lac_1')]),
                                                  lac_1_image_3d)
 
-            save_fits_data(lac_1_image_file, lac_1_image_3d.cpu().numpy(), self.compress_data)
-
+            save_fits_data_async(lac_1_image_file, lac_1_image_3d.cpu().numpy(), self.compress_data)
             del lac_1_image_3d
-
-            torch.cuda.empty_cache()
             self.logger.info("LAC 1 image saved as %s"%lac_1_image_file)
 
         if 'lac_2' in images:
@@ -1671,12 +1913,11 @@ class DEBISimPipeline(object):
                                                                                 'lac_2')]),
                                                  lac_2_image_3d)
 
-            save_fits_data(lac_2_image_file, lac_2_image_3d.cpu().numpy(), self.compress_data)
-
+            save_fits_data_async(lac_2_image_file, lac_2_image_3d.cpu().numpy(), self.compress_data)
             del lac_2_image_3d
-
-            torch.cuda.empty_cache()
             self.logger.info("LAC 2 image saved as %s"%lac_2_image_file)
+
+        torch.cuda.empty_cache()   # single cleanup after all GT images saved
     # --------------------------------------------------------------------------
 
     def plot_baggage_statistics(self):
@@ -1698,7 +1939,7 @@ class DEBISimPipeline(object):
                for x in self.sf_obj_list if x['lqd_flag']}
         }
 
-        max_label = max(list(lbl_materials.keys()))
+        max_label = builtins.max(list(lbl_materials.keys()))
 
         if spec_num==1:
 
@@ -1773,23 +2014,21 @@ class DEBISimPipeline(object):
             r_shape, g_shape = recon_img_1.shape, gt_img.shape
 
             if r_shape != g_shape:
-                r_buffer = np.ones_like(gt_img)*(-1000)
+                # Use the larger of the two shapes as the target buffer
+                buf_shape = tuple(builtins.max(r, g) for r, g in zip(r_shape, g_shape))
 
-                init_pt = [g//2-r//2 for g, r in zip(g_shape, r_shape)]
+                def _embed(src, target_shape):
+                    buf = np.ones(target_shape, dtype=src.dtype) * (-1000)
+                    offset = [(t - s) // 2 for t, s in
+                              zip(target_shape, src.shape)]
+                    buf[offset[0]:offset[0]+src.shape[0],
+                        offset[1]:offset[1]+src.shape[1],
+                        offset[2]:offset[2]+src.shape[2]] = src
+                    return buf
 
-                r_buffer[init_pt[0]:init_pt[0]+r_shape[0],
-                         init_pt[1]:init_pt[1]+r_shape[1],
-                         init_pt[2]:init_pt[2]+r_shape[2]] = recon_img_1.copy()
-                recon_img_1 = r_buffer.copy()
-
-                r_buffer = np.ones_like(gt_img)*(-1000)
-
-                init_pt = [g//2-r//2 for g, r in zip(g_shape, r_shape)]
-
-                r_buffer[init_pt[0]:init_pt[0]+r_shape[0],
-                         init_pt[1]:init_pt[1]+r_shape[1],
-                         init_pt[2]:init_pt[2]+r_shape[2]] = recon_img_2.copy()
-                recon_img_2 = r_buffer.copy()
+                recon_img_1 = _embed(recon_img_1, buf_shape)
+                recon_img_2 = _embed(recon_img_2, buf_shape)
+                gt_img = _embed(gt_img, buf_shape)
 
 
             rprops1 = regionprops(gt_img, recon_img_1)

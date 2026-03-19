@@ -28,7 +28,7 @@ from lib.forward_model.scanner_template import ScannerTemplate,\
 # -----------------------------------------------------------------------------
 # Step 1: Specify dataset parameter:
 
-bags_to_create = range(1, 10)                  # Number of bags to create
+bags_to_create = range(1, 1)                  # Number of bags to create
 sim_dir        = 'results/example_parallelbeam_3d_dect/' # simulation directory
 # -----------------------------------------------------------------------------
 
@@ -51,9 +51,10 @@ sim_dir        = 'results/example_parallelbeam_3d_dect/' # simulation directory
 
 scanner_mdl = create_parallel_scanner(
     gantry_diameter_mm=1024,    # real security belt FOV ~650-1000 mm
-    pixel_size_mm=2.0,          # 2 mm/voxel (change to 1.0 for high-res)
-    n_slices=350,
+    pixel_size_mm=1.0,          # 2 mm/voxel (change to 1.0 for high-res)
+    n_slices=512,
 )
+
 # -----------------------------------------------------------------------------
 
 # -----------------------------------------------------------------------------
@@ -127,21 +128,21 @@ stl_pool_config = dict(
         ),
         sharp_objects=dict(
             pool=discover_pool(STL_SHARP_DIR),
-            spawn_prob=0.5,         # 50% chance sharp objects appear
+            spawn_prob=0.0,         # 50% chance sharp objects appear
             count_range=(0, 2),
-            materials=['Fe', 'Ti'],
-            material_pdf=[0.6, 0.4],
+            materials=['Fe', 'Ti', 'Al'],
+            material_pdf=[0.6, 0.2, 0.2],
         ),
         explosives=dict(
             pool=discover_pool(STL_EXPLOSIVES_DIR),
-            spawn_prob=0.3,         # 30% chance explosives appear
+            spawn_prob=0.0,         # 30% chance explosives appear
             count_range=(0, 1),
             materials=['ethanol', 'acetal', 'acrylic'],
             material_pdf=[0.4, 0.3, 0.3],
         ),
         other=dict(
             pool=discover_pool(STL_OTHER_THREATS_DIR),
-            spawn_prob=0.3,         # 30% chance other threats appear
+            spawn_prob=0.0,         # 30% chance other threats appear
             count_range=(0, 1),
             materials=['acetal', 'bakelite'],
             material_pdf=[0.5, 0.5],
@@ -149,13 +150,13 @@ stl_pool_config = dict(
     ),
     fillers=dict(
         pool=discover_pool(STL_FILLERS_DIR),
-        count_range=(5, 15),
+        count_range=(0, 0),
         materials=mlist,
         material_pdf=material_pdf,
     ),
     liquid_containers=dict(
         pool=discover_pool(STL_LIQUID_CONTAINERS_DIR),
-        count_range=(0, 3),
+        count_range=(0, 0),
         container_materials=['pyrex', 'polyethylene', 'acrylic'],
         container_material_pdf=[0.4, 0.3, 0.3],
         liquid_materials=['water'],
@@ -164,7 +165,7 @@ stl_pool_config = dict(
     # mm_per_voxel: real-world size of each scene voxel.
     # Must match pixel_size_mm from the scanner above.
     # 1024mm FOV / 512px = 2.0 mm/voxel
-    mm_per_voxel=2.0,
+    mm_per_voxel=1.0,
     # mesh_units: unit system of the STL files.
     # Most 3D modelling tools export in metres by default.
     # Supported: 'mm', 'cm', 'in'/'inches', 'm'/'meters'

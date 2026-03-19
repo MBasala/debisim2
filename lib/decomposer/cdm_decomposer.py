@@ -325,14 +325,14 @@ class CDMDecomposer(DEDecomposer):
                 [scc, scp],
                 [self.photon_count_high, self.photon_count_low],
                 [self.spctrm_h.shape[0], self.spctrm_l.shape[0]],
-                self.spctrm_h[:, 0].copy().flatten(),
-                self.spctrm_l[:, 0].copy().flatten(),
-                self.spctrm_h[:, 1].copy().flatten(),
-                self.spctrm_l[:, 1].copy().flatten(),
-                self.spctrm_h_ph[:, 1].copy().flatten(),
-                self.spctrm_l_ph[:, 1].copy().flatten(),
-                self.spctrm_h_kn[:, 1].copy().flatten(),
-                self.spctrm_l_kn[:, 1].copy().flatten(),
+                self.spctrm_h[:, 0].flatten(),
+                self.spctrm_l[:, 0].flatten(),
+                self.spctrm_h[:, 1].flatten(),
+                self.spctrm_l[:, 1].flatten(),
+                self.spctrm_h_ph[:, 1].flatten(),
+                self.spctrm_l_ph[:, 1].flatten(),
+                self.spctrm_h_kn[:, 1].flatten(),
+                self.spctrm_l_kn[:, 1].flatten(),
             ))
 
             # Arrays
@@ -363,8 +363,7 @@ class CDMDecomposer(DEDecomposer):
                 GFdata_ac, GFw_ac, gf.ModelID.COMPTON_PE, GFinit_ac, GFtol,
                 GFmaxIter, None, gf.EstimatorID.LSE, GFui_ac)
 
-            GF_out = zeros_like(GFres[0])
-            GF_out.data = GF_out.data
+            GF_out = np.array(GFres[0], copy=True)
 
             sino_c = GF_out[:, 0].flatten().reshape(self.sino_shape)
             sino_p = GF_out[:, 1].flatten().reshape(self.sino_shape)

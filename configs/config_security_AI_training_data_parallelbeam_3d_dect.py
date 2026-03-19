@@ -120,29 +120,29 @@ stl_pool_config = dict(
     threats=dict(
         firearms=dict(
             pool=discover_pool(STL_FIREARMS_DIR),
-            spawn_prob=1.0,       # 100% chance firearms appear in a bag
-            count_range=(2, 2),   # always exactly 2 items
+            spawn_prob=0.025,         # 2.5% chance firearms appear in a bag
+            count_range=(1, 2),     # if they appear: 0-2 items
             materials=['Fe', 'Al'],
             material_pdf=[0.7, 0.3],
         ),
         sharp_objects=dict(
             pool=discover_pool(STL_SHARP_DIR),
-            spawn_prob=0.5,         # 50% chance sharp objects appear
-            count_range=(0, 2),
+            spawn_prob=0.1,         # 10% chance sharp objects appear
+            count_range=(1, 3),
             materials=['Fe', 'Ti'],
             material_pdf=[0.6, 0.4],
         ),
         explosives=dict(
             pool=discover_pool(STL_EXPLOSIVES_DIR),
-            spawn_prob=0.3,         # 30% chance explosives appear
-            count_range=(0, 1),
+            spawn_prob=0.015,         # 1.5% chance explosives appear
+            count_range=(1, 2),
             materials=['ethanol', 'acetal', 'acrylic'],
             material_pdf=[0.4, 0.3, 0.3],
         ),
         other=dict(
             pool=discover_pool(STL_OTHER_THREATS_DIR),
-            spawn_prob=0.3,         # 30% chance other threats appear
-            count_range=(0, 1),
+            spawn_prob=0.01,         # 1% chance other threats appear
+            count_range=(1, 3),
             materials=['acetal', 'bakelite'],
             material_pdf=[0.5, 0.5],
         ),
@@ -155,7 +155,7 @@ stl_pool_config = dict(
     ),
     liquid_containers=dict(
         pool=discover_pool(STL_LIQUID_CONTAINERS_DIR),
-        count_range=(0, 3),
+        count_range=(1, 3),
         container_materials=['pyrex', 'polyethylene', 'acrylic'],
         container_material_pdf=[0.4, 0.3, 0.3],
         liquid_materials=['water'],

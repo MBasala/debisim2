@@ -324,7 +324,7 @@ class Object3D(object):
         try:
             bin_data = self.data.copy()//self.label
             erode_elem = ball(self.cntr_thickness)
-            eroded_img = binary_erosion(bin_data, selem=erode_elem)
+            eroded_img = scipy.ndimage.binary_erosion(bin_data, structure=erode_elem)
             e_row, temp1, temp2 = np.where(eroded_img)
             e_fill = int((1 - self.lqd_level) * (e_row.max() - e_row.min()))
             e_fill_img = eroded_img.copy()
@@ -779,12 +779,21 @@ class Object3D(object):
         mask = sptx.rotate(mask, theta[1], axes=(2,1), order=0)
         mask = sptx.rotate(mask, theta[2], axes=(0,2), order=0)
 
-        mask = sktr.rescale(mask.astype(float), scale, preserve_range=True)
+        if scale != 1.0:
+            mask = sktr.rescale(mask.astype(float), scale, preserve_range=True)
 
         mask[mask < 0.5] = 0
         mask[mask > 1]   = 1
 
         box_coord = mask.nonzero()
+
+        if box_coord[0].size == 0:
+            # Mask is empty after rotation/rescale — fall back to a
+            # minimal 2×2×2 solid so placement doesn't crash.
+            self.data = np.ones((2, 2, 2), dtype=bool)
+            self.dim = array([2, 2, 2])
+            return
+
         box_dim = box_coord[0].max()-box_coord[0].min()+1, \
             box_coord[1].max()-box_coord[1].min()+1, \
             box_coord[2].max()-box_coord[2].min()+1
@@ -1014,25 +1023,39 @@ class BaggageImage3D(object):
         self.logger.info('\n')
     # -------------------------------------------------------------------------
 
-    def replace_boundary_with_stl(self, stl_path, voxel_resolution=64):
+    def replace_boundary_with_stl(self, stl_path, mesh_units='m'):
         """
         -----------------------------------------------------------------------
         Replace the default cubic bag boundary with a voxelized STL bag shape.
 
-        :param stl_path:            path to the STL file for the bag shape
-        :param voxel_resolution:    target voxel resolution for STL loading
+        The STL bag is loaded at a coarse resolution (128 voxels on longest
+        axis), converted to mm via ``mesh_units``, then uniformly scaled to
+        fit inside the cavity region ``(2*bb_h)^3`` preserving aspect ratio.
+
+        :param stl_path:        path to the STL file for the bag shape
+        :param mesh_units:      unit system of the STL file (default 'm')
         :return:
         -----------------------------------------------------------------------
         """
         self.logger.info(f"Replacing bag boundary with STL: {stl_path}")
 
-        mask = load_mesh_file(stl_path, target_voxel_size=voxel_resolution)
+        # Bags are rescaled to fit the cavity regardless, so voxelize at a
+        # coarse resolution (longest axis → 128 voxels) to keep it fast,
+        # then resize to the cavity dimensions.
+        mask = load_mesh_file(stl_path, target_voxel_size=128,
+                              mesh_units=mesh_units)
         mask = mask.astype(bool)
 
-        # Scale mask to fit within the boundary region (2*bb_h per axis)
-        target_shape = (2 * self.bb_h, 2 * self.bb_h, 2 * self.bb_h)
-        mask = sktr.resize(mask, target_shape, order=0,
-                           preserve_range=True).astype(bool)
+        # Fit mask into the cavity (2*bb_h per axis) preserving aspect ratio
+        cavity = 2 * self.bb_h
+        scale_factor = cavity / max(mask.shape)
+        if scale_factor != 1.0:
+            mask = sktr.rescale(mask.astype(float), scale_factor,
+                                order=0, preserve_range=True).astype(bool)
+
+        self.logger.info(
+            f"  Bag STL voxelized: {mask.shape} "
+            f"(cavity={cavity}, scale={scale_factor:.3f})")
 
         # Create hollow shell by eroding the solid mask
         eroded = sptx.binary_erosion(mask, iterations=self.bb_t)
@@ -1046,15 +1069,120 @@ class BaggageImage3D(object):
                     ctr - h - t:ctr + h + t,
                     ctr - h - t:ctr + h + t] = 0
 
-        # Place new shell boundary in ws_bag
+        # Center the (potentially non-cubic) shell in the cavity
+        ms = np.array(shell.shape)
+        offset = ctr - ms // 2
+        end = offset + ms
+
         new_bound = np.zeros((self.size, self.size, self.size), dtype=bool)
-        new_bound[ctr - h:ctr + h, ctr - h:ctr + h, ctr - h:ctr + h] = shell
+        new_bound[offset[0]:end[0], offset[1]:end[1], offset[2]:end[2]] = shell
         self.ws_bag += self.bb_label * new_bound.astype(self.ws_bag.dtype)
 
         # Update boundary mask for overlap checking
         self.boundary = new_bound
 
         self.logger.info("Bag boundary replaced successfully.")
+    # -------------------------------------------------------------------------
+
+    def create_calibration_phantom(self, materials, grid=(5, 5),
+                                   block_size=30, gap=20):
+        """
+        -----------------------------------------------------------------------
+        Create a deterministic 2D grid of labelled cuboid blocks for
+        calibration / algorithm testing.
+
+        Each block is a homogeneous material cube placed at a fixed position
+        in the XY plane (single layer in Z).  No bag boundary is generated.
+
+        :param materials:   ordered list of material names
+                            (length must equal grid[0] * grid[1])
+        :param grid:        (rows, cols) grid dimensions
+        :param block_size:  side length of each cube in voxels
+        :param gap:         spacing between cubes in voxels
+        :return:            None — mutates self.ws_bag, self.param_file,
+                            and self.virtual_bag in place
+        -----------------------------------------------------------------------
+        """
+        rows, cols = grid
+        n_blocks = rows * cols
+        if len(materials) != n_blocks:
+            raise ValueError(
+                f"phantom_materials has {len(materials)} entries but "
+                f"grid {grid} requires {n_blocks}")
+
+        # Clear the default bag boundary — phantom needs no bag shell
+        self.ws_bag[:] = 0
+        self.boundary[:] = 0
+        self.bg_sf_list = []
+        self.param_file = []
+
+        # Grid layout centred in the working volume
+        total_x = rows * block_size + (rows - 1) * gap
+        total_y = cols * block_size + (cols - 1) * gap
+
+        ctr = self.size // 2
+        start_x = ctr - total_x // 2
+        start_y = ctr - total_y // 2
+        z_start = ctr - block_size // 2   # single layer centred in Z
+
+        obj_list = []
+        label = self.bb_label + 1         # labels start after bag boundary (3)
+        self.start_label = label
+
+        self.logger.info(
+            f"Creating calibration phantom: {rows}x{cols} grid, "
+            f"block={block_size}, gap={gap}")
+
+        for r in range(rows):
+            for c in range(cols):
+                mat = materials[r * cols + c]
+
+                px = start_x + r * (block_size + gap)
+                py = start_y + c * (block_size + gap)
+                pz = z_start
+
+                # Place block directly into ws_bag — bypasses add_object's
+                # dim//2 convention which doesn't match Box data shape.
+                self.ws_bag[px:px + block_size,
+                            py:py + block_size,
+                            pz:pz + block_size] = label
+
+                # Build a minimal obj_dict for sf_obj_list / DICOM output
+                obj_dict = dict(
+                    shape='B',
+                    label=label,
+                    material=mat,
+                    geom=dict(center=array([px, py, pz]),
+                              dim=array([block_size, block_size, block_size]),
+                              rot=array([0, 0, 0])),
+                    lqd_flag=False,
+                    lqd_param=None,
+                    category='phantom_block',
+                    threat=False,
+                )
+                self.param_file.append(obj_dict)
+
+                self.logger.info(
+                    f"  [{r},{c}] label={label} material={mat} "
+                    f"pose=({px},{py},{pz})")
+                label += 1
+
+        self.end_label = label
+        self.lqd_count = label
+
+        # Finalize virtual_bag from ws_bag (same as create_baggage_image
+        # does, but without shape grammar or Object3D overhead)
+        self.virtual_bag = self.ws_bag[
+            self.size // 2 - self.img_vol[0] // 2:
+            self.size // 2 + self.img_vol[0] // 2,
+            self.size // 2 - self.img_vol[1] // 2:
+            self.size // 2 + self.img_vol[1] // 2,
+            :self.img_vol[2]
+        ].copy()
+
+        self.logger.info(
+            f"Calibration phantom complete: {n_blocks} blocks placed, "
+            f"virtual_bag shape={self.virtual_bag.shape}")
     # -------------------------------------------------------------------------
 
     def create_random_object_list(self,
@@ -1073,7 +1201,8 @@ class BaggageImage3D(object):
                                   custom_obj_prob=0.0,
                                   metal_dict={'metal_amt': None, 'metal_size': None},
                                   target_dict={'num_range': None, 'is_liquid': False},
-                                  stl_pool_config=None
+                                  stl_pool_config=None,
+                                  stl_only=False
                                   ):
 
         """
@@ -1160,27 +1289,39 @@ class BaggageImage3D(object):
         # STL Pool Generation Phases
         # =================================================================
         if stl_pool_config is not None:
-            voxel_res = stl_pool_config.get('voxel_resolution', 64)
+            # mm_per_voxel: real-world size of each scene voxel (default 1.0
+            # i.e. 1 voxel = 1 mm).  STL meshes are voxelized at this pitch
+            # so their native dimensions (assumed mm) map correctly into the
+            # scene grid.
+            # Legacy fallback: if voxel_resolution is set, use the old
+            # normalised-size mode instead.
+            mm_per_voxel = stl_pool_config.get('mm_per_voxel', 1.0)
+            mesh_units = stl_pool_config.get('mesh_units', 'm')
+            voxel_res = stl_pool_config.get('voxel_resolution', None)
             label_idx = self.start_label
 
             # Phase 0: Replace bag boundary with STL bag shape
+            # use_stl_bag: True = always use random STL bag, False = never,
+            #              omitted/None = use if pool is non-empty
             bags_cfg = stl_pool_config.get('bags', {})
             bag_pool = bags_cfg.get('pool', [])
-            if len(bag_pool) > 0:
-                bag_stl = np.random.choice(bag_pool)
-                self.replace_boundary_with_stl(bag_stl,
-                                               voxel_resolution=voxel_res)
+            use_stl_bag = stl_pool_config.get('use_stl_bag', None)
+            if use_stl_bag is True or (use_stl_bag is None and len(bag_pool) > 0):
+                if len(bag_pool) > 0:
+                    bag_stl = np.random.choice(bag_pool)
+                    self.replace_boundary_with_stl(
+                        bag_stl, mesh_units=mesh_units)
+                else:
+                    self.logger.warning(
+                        "use_stl_bag=True but no STL bag files found in pool")
 
             # Helper to create an Object3D from a pool file
             def _create_pool_object(pool_file, mat, label_id,
                                     lqd_flag=False, lqd_param=None):
-                c_geom = dict()
-                c_geom['center'] = array([0, 0, 0])
-                c_geom['dim'] = np.random.rand(3) * diff_dim + min_dim
-                c_geom['scale'] = np.random.rand() * 1.0 + 0.5
-                c_geom['src'] = pool_file
                 mask = load_mesh_file(pool_file,
-                                      target_voxel_size=voxel_res)
+                                      target_voxel_size=voxel_res,
+                                      mm_per_voxel=mm_per_voxel,
+                                      mesh_units=mesh_units)
 
                 if lqd_flag:
                     # For liquid containers: orient upright so the
@@ -1188,12 +1329,32 @@ class BaggageImage3D(object):
                     # Only allow yaw rotation (axis 1 rot) to keep
                     # the waterline parallel to the ground plane.
                     mask = orient_mask_upright(mask)
-                    c_geom['rot'] = array([0.0,
-                                           np.random.rand() * 360,
-                                           0.0])
+                    rot = array([0.0, np.random.rand() * 360, 0.0])
                 else:
-                    c_geom['rot'] = np.random.rand(3) * 90
+                    rot = np.random.rand(3) * 90
 
+                # If the object is larger than the bag cavity, scale
+                # it down to fit (preserving aspect ratio)
+                cavity = 2 * self.bb_h
+                max_obj_dim = max(mask.shape)
+                if max_obj_dim > cavity:
+                    fit_scale = (cavity - 4) / max_obj_dim  # -4 for margin
+                    mask = sktr.rescale(mask.astype(float), fit_scale,
+                                        order=0,
+                                        preserve_range=True).astype(bool)
+                    self.logger.info(
+                        f"  Object too large ({max_obj_dim} > {cavity}), "
+                        f"scaled to {mask.shape}")
+
+                c_geom = dict()
+                c_geom['center'] = array([0, 0, 0])
+                # dim is set from the mask's shape — preserves
+                # real-world proportions
+                c_geom['dim'] = array(mask.shape, dtype=float)
+                # scale = 1.0 preserves dimensions as-is
+                c_geom['scale'] = 1.0
+                c_geom['rot'] = rot
+                c_geom['src'] = pool_file
                 c_geom['mask'] = mask
 
                 obj_dict = self.slh.create_sim_object(
@@ -1207,6 +1368,10 @@ class BaggageImage3D(object):
                     int(np.random.rand() * pose_diff + pose_range[0])
                 ])
 
+                self.logger.info(
+                    f"  STL native size: {mask.shape} voxels "
+                    f"(~{array(mask.shape)*mm_per_voxel} mm)")
+
                 return Object3D(obj_dict=obj_dict, obj_pose=c_pose)
 
             # Phase 1: Threat objects
@@ -1215,6 +1380,14 @@ class BaggageImage3D(object):
                 cat_pool = cat_cfg.get('pool', [])
                 if len(cat_pool) == 0:
                     continue
+
+                # spawn_prob: probability this category appears at all (default 1.0)
+                spawn_prob = cat_cfg.get('spawn_prob', 1.0)
+                if np.random.rand() > spawn_prob:
+                    self.logger.info(
+                        f"STL threat ({cat_name}): skipped (spawn_prob={spawn_prob})")
+                    continue
+
                 count_range = cat_cfg.get('count_range', (0, 0))
                 count = np.random.randint(count_range[0], count_range[1] + 1)
                 cat_materials = cat_cfg.get('materials', material_list)
@@ -1224,6 +1397,8 @@ class BaggageImage3D(object):
                     pool_file = np.random.choice(cat_pool)
                     mat = np.random.choice(cat_materials, p=cat_pdf)
                     obj = _create_pool_object(pool_file, mat, label_idx)
+                    obj.obj_dict['category'] = cat_name
+                    obj.obj_dict['threat'] = True
                     obj_list.append(obj)
                     label_idx += 1
                     target_counter += 1
@@ -1245,6 +1420,8 @@ class BaggageImage3D(object):
                     pool_file = np.random.choice(filler_pool)
                     mat = np.random.choice(filler_materials, p=filler_pdf)
                     obj = _create_pool_object(pool_file, mat, label_idx)
+                    obj.obj_dict['category'] = 'filler'
+                    obj.obj_dict['threat'] = False
                     obj_list.append(obj)
                     label_idx += 1
                     self.logger.info(
@@ -1282,6 +1459,8 @@ class BaggageImage3D(object):
                     obj = _create_pool_object(
                         pool_file, cntr_mat, label_idx,
                         lqd_flag=True, lqd_param=lqd_param)
+                    obj.obj_dict['category'] = 'liquid_container'
+                    obj.obj_dict['threat'] = False
                     obj_list.append(obj)
                     label_idx += 1
                     self.logger.info(
@@ -1300,6 +1479,12 @@ class BaggageImage3D(object):
                 f"{builtins.max(0, remaining)} primitives remaining")
 
         # =================================================================
+
+        if stl_only:
+            self.logger.info(
+                "stl_only=True — skipping primitive shape generation")
+            rdm.shuffle(obj_list)
+            return obj_list
 
         # iterate for the number of objects specified
         for i in range(self.start_label, self.end_label):
@@ -1433,6 +1618,8 @@ class BaggageImage3D(object):
 
             # =================================================================
             # Create an Object3D instance for the current SL dictionary
+            obj_dict['category'] = 'primitive'
+            obj_dict['threat'] = False
             curr_obj = Object3D(
                 obj_dict=obj_dict,
                 obj_pose=c_pose
@@ -1641,6 +1828,8 @@ class BaggageImage3D(object):
 
                 obj_dict, curr_obj = change_object_material('target',
                                                             target_dict['is_liquid'])
+                curr_obj.obj_dict['category'] = 'primitive_target'
+                curr_obj.obj_dict['threat'] = True
                 obj_list.append(curr_obj)
                 target_counter += 1
                 self.logger.info("Number of targets:%i"%target_counter)
@@ -1654,7 +1843,8 @@ class BaggageImage3D(object):
     def create_baggage_image(self,
                              obj_list,
                              with_shape_grammar=True,
-                             save_data=True):
+                             save_data=True,
+                             prevent_overlap=False):
         """
         -----------------------------------------------------------------------
         Create a 3D Baggage image using shape grammar and from the input list
@@ -1664,12 +1854,17 @@ class BaggageImage3D(object):
         :param with_shape_grammar:  set to True to include shape grammar
         :param save_data:           set to true if the baggage data or shape
                                     file are to be saved
+        :param prevent_overlap:     set to True to enable the overlap rule,
+                                    which laterally shifts objects to reduce
+                                    overlapping regions
         :return:
         -----------------------------------------------------------------------
         """
 
         self.logger.info("\nCreating Baggage from Object List ...")
         self.logger.info("="*80)
+        if prevent_overlap:
+            self.logger.info("Overlap prevention ENABLED")
 
         for k, bag_obj in enumerate(obj_list):
 
@@ -1683,11 +1878,11 @@ class BaggageImage3D(object):
 
             if with_shape_grammar:
                 self.add_object(bag_obj,
-                                with_overlap_rule=False,
+                                with_overlap_rule=prevent_overlap,
                                 with_gravity_rule=True)
             else:
                 self.add_object(bag_obj,
-                                with_overlap_rule=False,
+                                with_overlap_rule=prevent_overlap,
                                 with_gravity_rule=False)
 
             self.logger.info(f"Final. Pose:"
@@ -1797,17 +1992,24 @@ class BaggageImage3D(object):
         -----------------------------------------------------------------------
         """
 
-        bag_data = self.ws_bag.copy()
-        bag_data[np.where(self.boundary)]=0
+        # Only extract the local region around the object — avoids copying
+        # the entire volume on every gravity-loop iteration.
+        p = bag_obj.pose
+        s = bag_obj.data.shape
 
-        obj_loc = bag_data[
-                  bag_obj.pose[0]: bag_obj.pose[0] + bag_obj.data.shape[0],
-                  bag_obj.pose[1]: bag_obj.pose[1] + bag_obj.data.shape[1],
-                  bag_obj.pose[2]: bag_obj.pose[2] + bag_obj.data.shape[2]]
+        obj_loc = self.ws_bag[p[0]:p[0]+s[0],
+                              p[1]:p[1]+s[1],
+                              p[2]:p[2]+s[2]].copy()
+
+        # Zero out boundary voxels in the local slice only
+        bnd_loc = self.boundary[p[0]:p[0]+s[0],
+                                p[1]:p[1]+s[1],
+                                p[2]:p[2]+s[2]]
+        obj_loc[bnd_loc.astype(bool)] = 0
 
         obj_int = bag_obj.data[:obj_loc.shape[0],
                                :obj_loc.shape[1],
-                               :obj_loc.shape[2]]*obj_loc.astype(bool)
+                               :obj_loc.shape[2]] * obj_loc.astype(bool)
         out_flag = np.any(obj_int.astype(bool))
 
         return out_flag, obj_int

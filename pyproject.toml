@@ -20,7 +20,8 @@ dependencies = [
     "tqdm",
     "matplotlib",
     "pydicom",
-    "astropy"
+    "astropy",
+    "psutil"
 ]
 
 [tool.uv.sources]
