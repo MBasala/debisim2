@@ -28,29 +28,33 @@ docker run --rm --gpus all \
 
         mkdir -p /tmp/gpufit_build && cd /tmp/gpufit_build
 
-        # Only build Gpufit (GPU) target — skip Cpufit which has
-        # compilation issues and is not needed for the Python wheel.
+        # Force modern CUDA architectures only — CUDA 13.x dropped
+        # support for sm_53/sm_60/sm_61/sm_70/sm_72.
+        # Override FindCUDA auto-detection via CUDA_NVCC_FLAGS.
         cmake /build/src \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
-            2>&1 | tail -10
+            -DCUDA_NVCC_FLAGS="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=compute_90" \
+            2>&1
 
-        # Build only the Gpufit target (not Cpufit)
-        cmake --build . --target Gpufit --parallel $(nproc) 2>&1 | tail -10
+        # Build only the Gpufit target (skip Cpufit)
+        # Show full output for debugging
+        cmake --build . --target Gpufit --parallel $(nproc) 2>&1
 
         # On Linux with make, output is in build root (not Release/)
         # Find the pyGpufit directory
         PYDIR=$(find /tmp/gpufit_build -name "setup.py" -path "*/pyGpufit/*" -printf "%h\n" | head -1)
         if [ -z "$PYDIR" ]; then
             echo "ERROR: Could not find pyGpufit setup.py"
-            find /tmp/gpufit_build -name "*.py" | head -20
+            echo "Build tree:"
+            find /tmp/gpufit_build -type f -name "*.so" -o -name "*.py" | head -30
             exit 1
         fi
 
         echo "Found pyGpufit at: $PYDIR"
         cd "$PYDIR"
         python3 -m pip wheel . --no-deps --break-system-packages \
-            -w /build/out/ 2>&1 | tail -5
+            -w /build/out/ 2>&1
 
         echo ""
         echo "=== Built wheel ==="
