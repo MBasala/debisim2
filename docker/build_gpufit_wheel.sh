@@ -20,11 +20,20 @@ echo "  PROJECT_ROOT: $PROJECT_ROOT"
 echo "  Source: $PROJECT_ROOT/deps/Gpufit_build"
 echo "  Output: $SCRIPT_DIR"
 
+# If running under WSL, convert Windows-style paths to /mnt/ paths
+if grep -qi microsoft /proc/version 2>/dev/null; then
+    # WSL detected — resolve to native Linux mount if needed
+    if [[ "$PROJECT_ROOT" == /c/* ]] || [[ "$PROJECT_ROOT" == /C/* ]]; then
+        PROJECT_ROOT="/mnt${PROJECT_ROOT}"
+        SCRIPT_DIR="$PROJECT_ROOT/docker"
+        echo "  WSL detected, adjusted to: $PROJECT_ROOT"
+    fi
+fi
+
 # Verify source exists before launching Docker
 if [ ! -d "$PROJECT_ROOT/deps/Gpufit_build" ]; then
     echo "ERROR: Gpufit_build not found at $PROJECT_ROOT/deps/Gpufit_build"
-    echo "If running from WSL, cd to the /mnt/c/... path first:"
-    echo "  cd /mnt/c/path/to/debisim2/docker && bash build_gpufit_wheel.sh"
+    echo "Run this script from the project's docker/ directory."
     exit 1
 fi
 
