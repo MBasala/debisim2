@@ -21,6 +21,7 @@ import builtins
 import warnings
 warnings.filterwarnings('ignore')
 from tqdm import tqdm
+import numpy as np
 from numpy import *
 from lib.misc.util import save_fits_data, save_fits_data_async, flush_async_io
 
@@ -1000,7 +1001,7 @@ class DEBISimPipeline(object):
         s_projn = torch.as_tensor(projn, dtype=torch.float, device=_device)
 
         s_projn = torch.where(s_projn<1,
-                              torch.Tensor([1.0]), s_projn)
+                              torch.tensor(1.0, device=_device), s_projn)
         s_projn = torch.log(s_projn)
         s_projn = torch.neg(s_projn)
         s_projn = torch.add(s_projn,  log(pc_sum))

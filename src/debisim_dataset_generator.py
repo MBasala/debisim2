@@ -89,13 +89,17 @@ def _process_single_bag(args_tuple):
     print(f"[Worker {os.getpid()}] Acquired GPU {gpu_id} for {bag_dir}")
 
     try:
-        # Initialize CUDA context in this worker process
+        # Initialize CUDA context in this worker process.
+        # IMPORTANT: these imports are deferred to AFTER CUDA_VISIBLE_DEVICES
+        # is set, so that torch binds to the correct GPU.  The module-level
+        # `from src.debisim_pipeline import *` may have already imported torch
+        # but without initializing CUDA (spawn re-imports the module).
         import torch
         if gpu_id >= 0 and torch.cuda.is_available():
             torch.cuda.init()
             torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
-        # Reconstruct scanner from picklable parameters
+        from src.debisim_pipeline import DEBISimPipeline
         from lib.forward_model.scanner_template import ScannerTemplate
         scanner = ScannerTemplate(
             geometry=scanner_init_args['geometry'],

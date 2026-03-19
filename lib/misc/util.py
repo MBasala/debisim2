@@ -435,7 +435,6 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
     """
     import datetime
     from pydicom.dataset import Dataset, FileDataset
-    from pydicom.sequence import Sequence as DicomSequence
 
     if scan_metadata is None:
         scan_metadata = {}
