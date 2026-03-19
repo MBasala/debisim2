@@ -39,7 +39,8 @@ from skimage.measure import regionprops
 from matplotlib import rcParams
 
 rcParams.update({'figure.autolayout': True})
-torch.set_default_tensor_type(torch.cuda.FloatTensor)
+if torch.cuda.is_available():
+    torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
 """-----------------------------------------------------------------------------
 * Module Description:
@@ -838,8 +839,9 @@ class DEBISimPipeline(object):
         kev_list = list(self.keV_range[:curr_spectrum.size])
         kev_iter = tqdm(kev_list)
 
-        # Process in batches
-        batch_start = 0
+        # Process in batches (init to -batch_size so the first iteration
+        # triggers a fill)
+        batch_start = -batch_size
         for e in kev_iter:
             k = e - self.keV_range[0]
 

@@ -120,8 +120,8 @@ stl_pool_config = dict(
     threats=dict(
         firearms=dict(
             pool=discover_pool(STL_FIREARMS_DIR),
-            spawn_prob=1,         # 50% chance firearms appear in a bag
-            count_range=(2, 2),     # if they appear: 0-2 items
+            spawn_prob=1.0,       # 100% chance firearms appear in a bag
+            count_range=(2, 2),   # always exactly 2 items
             materials=['Fe', 'Al'],
             material_pdf=[0.7, 0.3],
         ),

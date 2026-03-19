@@ -616,7 +616,7 @@ def create_rtstruct(output_path, roi_list, gt_label_volume,
     time_str = now.strftime('%H%M%S.%f')
 
     ds = FileDataset(output_path, {}, preamble=b'\x00' * 128)
-    ds.SOPClassUID = '1.2.840.10008.5.1.1.481.3'  # RT Structure Set Storage
+    ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.481.3'  # RT Structure Set Storage
     ds.SOPInstanceUID = uid.generate_uid()
     ds.StudyInstanceUID = ct_series_uids['study_uid']
     ds.SeriesInstanceUID = uid.generate_uid()
