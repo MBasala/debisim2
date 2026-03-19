@@ -26,19 +26,31 @@ docker run --rm --gpus all \
         apt-get update -qq && apt-get install -y -qq \
             cmake python3-dev python3-pip python3-venv > /dev/null 2>&1
 
-        cd /build/src
         mkdir -p /tmp/gpufit_build && cd /tmp/gpufit_build
 
+        # Only build Gpufit (GPU) target — skip Cpufit which has
+        # compilation issues and is not needed for the Python wheel.
         cmake /build/src \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
-            2>&1 | tail -5
+            2>&1 | tail -10
 
-        cmake --build . --config Release --parallel $(nproc) 2>&1 | tail -5
+        # Build only the Gpufit target (not Cpufit)
+        cmake --build . --target Gpufit --parallel $(nproc) 2>&1 | tail -10
 
-        cd Release/pyGpufit
+        # On Linux with make, output is in build root (not Release/)
+        # Find the pyGpufit directory
+        PYDIR=$(find /tmp/gpufit_build -name "setup.py" -path "*/pyGpufit/*" -printf "%h\n" | head -1)
+        if [ -z "$PYDIR" ]; then
+            echo "ERROR: Could not find pyGpufit setup.py"
+            find /tmp/gpufit_build -name "*.py" | head -20
+            exit 1
+        fi
+
+        echo "Found pyGpufit at: $PYDIR"
+        cd "$PYDIR"
         python3 -m pip wheel . --no-deps --break-system-packages \
-            -w /build/out/ 2>&1 | tail -3
+            -w /build/out/ 2>&1 | tail -5
 
         echo ""
         echo "=== Built wheel ==="
