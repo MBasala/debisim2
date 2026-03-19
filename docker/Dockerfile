@@ -6,15 +6,24 @@
 #   Stage 2 (deps-builder):   install all Python deps into a venv via uv
 #   Stage 3 (runtime):        slim CUDA base image + venv + app code
 #
-# Usage (from docker/ directory):
+# Build args:
+#   CUDA_VERSION  - CUDA version tag (default: 12.8.1)
+#   TORCH_INDEX   - PyTorch wheel index (default: cu128)
+#
+# Usage:
+#   # CUDA 12.8 (RunPod / cloud compatible):
 #   docker compose build
-#   docker compose run debisim2p5 --config configs/config_calibration_phantom_dect.py
+#
+#   # CUDA 13.1 (local workstation with latest driver):
+#   docker compose build --build-arg CUDA_VERSION=13.1.0 --build-arg TORCH_INDEX=cu130
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
 
+ARG CUDA_VERSION=12.8.1
+
 # ---- Stage 1: Build gpufit from source ------------------------------------
-FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS gpufit-builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS gpufit-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -38,8 +47,10 @@ RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ 
     python3 -m pip wheel . --no-deps -w /wheels/
 
 # ---- Stage 2: Install Python deps into a venv ----------------------------
-FROM nvidia/cuda:13.1.0-base-ubuntu24.04 AS deps-builder
+ARG CUDA_VERSION
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04 AS deps-builder
 
+ARG TORCH_INDEX=cu128
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -63,7 +74,7 @@ COPY --from=gpufit-builder /wheels/ /tmp/wheels/
 
 # Install all Python dependencies
 RUN uv pip install --no-cache \
-        torch --index-url https://download.pytorch.org/whl/cu130 && \
+        torch --index-url https://download.pytorch.org/whl/${TORCH_INDEX} && \
     uv pip install --no-cache \
         astra-toolbox \
         pyyaml tabulate scikit-image scipy \
@@ -73,7 +84,8 @@ RUN uv pip install --no-cache \
     rm -rf /tmp/wheels
 
 # ---- Stage 3: Slim runtime image -----------------------------------------
-FROM nvidia/cuda:13.1.0-base-ubuntu24.04
+ARG CUDA_VERSION
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -81,9 +93,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN useradd -m -s /bin/bash debisim
 
 # Minimal runtime dependencies (no uv, no pip, no -dev)
+# Use wildcard for CUDA lib version so it works across 12.x and 13.x
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv \
-        libgomp1 libcublas-13-1 libcusparse-13-1 \
+        libgomp1 'libcublas-*' 'libcusparse-*' \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
