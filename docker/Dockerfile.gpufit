@@ -31,11 +31,19 @@ RUN cmake /build/src \
 # Build only the Gpufit target (skip Cpufit)
 RUN cmake --build . --target Gpufit --parallel $(nproc)
 
-# Find and build the Python wheel
-RUN PYDIR=$(find /tmp/gpufit_build -name "setup.py" -path "*/pyGpufit/*" -printf "%h\n" | head -1) && \
+# Debug: show build output tree, then find and build the Python wheel
+RUN echo "=== Build output ===" && \
+    find /tmp/gpufit_build -name "*.so" -o -name "*.py" -o -name "setup.py" | sort && \
+    echo "=== Gpufit source ===" && \
+    find /build/src -name "setup.py" | sort && \
+    PYDIR=$(find /build/src -name "setup.py" -path "*/pyGpufit/*" -printf "%h\n" | head -1) && \
+    if [ -z "$PYDIR" ]; then \
+        PYDIR=$(find /tmp/gpufit_build -name "setup.py" -printf "%h\n" | head -1); \
+    fi && \
     echo "pyGpufit at: $PYDIR" && \
     cd "$PYDIR" && \
-    python3 -m pip wheel . --no-deps --break-system-packages -w /wheels/
+    pip install wheel --break-system-packages 2>/dev/null || true && \
+    python3 -m pip wheel . --no-deps -w /wheels/
 
 # Default: copy wheel to mounted /out volume
 CMD ["sh", "-c", "cp /wheels/*.whl /out/ && echo 'Wheel copied to /out:' && ls -la /out/*.whl"]
