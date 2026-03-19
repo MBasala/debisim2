@@ -1,9 +1,12 @@
 # ===========================================================================
 # DEBISim2 Docker Image
 #
-# Multi-stage build:
-#   Stage 1 (builder): compile gpufit wheel from source
-#   Stage 2 (runtime): slim CUDA image with Python + all deps
+# Single-stage build using pre-built gpufit wheel (custom COMPTON_PE +
+# MATERIAL_BASIS models compiled locally, copied into the image).
+#
+# NOTE: The gpufit wheel must be pre-built for Linux before building
+#       this image. See deps/gpufit/README.md for build instructions.
+#       Place the wheel at: docker/pyGpufit-linux.whl
 #
 # Usage:
 #   docker build -t debisim2 .
@@ -14,29 +17,6 @@
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
 
-# ---- Stage 1: Build gpufit from source ------------------------------------
-FROM nvidia/cuda:13.2.0-devel-ubuntu24.04 AS gpufit-builder
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        cmake git python3-dev python3-pip python3-venv && \
-    rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-# Copy gpufit source and build
-COPY deps/Gpufit_build /build/Gpufit_build
-WORKDIR /build/Gpufit_build
-
-RUN mkdir -p build && cd build && \
-    cmake .. \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DCUDA_ARCHITECTURES="70;75;80;86;89;90" \
-        -DBUILD_TESTING=OFF && \
-    cmake --build . --config Release --parallel $(nproc) && \
-    cd Release/pyGpufit && \
-    python3 -m pip wheel . --no-deps --break-system-packages -w /build/wheels/
-
-# ---- Stage 2: Runtime image -----------------------------------------------
 FROM nvidia/cuda:13.2.0-runtime-ubuntu24.04
 
 # Prevent interactive prompts during apt install
@@ -54,13 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -s /bin/bash debisim
 WORKDIR /app
 
-# Install uv binary directly (avoids PEP 668 restriction, no curl needed)
+# Install uv binary directly (avoids PEP 668 restriction)
 ADD https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz /tmp/uv.tar.gz
 RUN tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 && \
     rm /tmp/uv.tar.gz && \
     chmod +x /usr/local/bin/uv
 
-# Create venv first (all deps install into it, not system Python)
+# Create venv (all deps install here, not system Python)
 RUN uv venv /app/.venv
 ENV VIRTUAL_ENV="/app/.venv"
 ENV PATH="/app/.venv/bin:$PATH"
@@ -68,8 +48,10 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Copy dependency specification first (cache layer)
 COPY pyproject.docker.toml /app/pyproject.toml
 
-# Copy gpufit wheel from builder stage
-COPY --from=gpufit-builder /build/wheels/ /app/wheels/
+# Copy pre-built gpufit wheel (custom COMPTON_PE + MATERIAL_BASIS models)
+# If no Linux wheel exists yet, the build will still succeed without it
+# (gpufit features will be unavailable at runtime).
+COPY docker/ /app/docker/
 
 # Install Python dependencies into the venv
 RUN uv pip install --no-cache \
@@ -79,8 +61,9 @@ RUN uv pip install --no-cache \
         pyyaml tabulate scikit-image scikit-learn scipy \
         trimesh tqdm matplotlib pydicom astropy psutil brt \
         scipy-stubs pytest pytest-mock && \
-    uv pip install --no-cache /app/wheels/*.whl && \
-    rm -rf /app/wheels
+    ( ls /app/docker/*.whl 2>/dev/null && \
+      uv pip install --no-cache /app/docker/*.whl || true ) && \
+    rm -rf /app/docker
 
 # Copy application code
 COPY lib/ /app/lib/
