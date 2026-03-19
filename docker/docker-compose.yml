@@ -3,9 +3,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: fly0ut/debisim2p5:latest
+      args:
+        CUDA_VERSION: ${CUDA_VERSION:-12.6.3}
+        TORCH_INDEX: ${TORCH_INDEX:-cu126}
+    image: fly0ut/debisim2p5:${CUDA_TAG:-cuda12.6}
 
-    # GPU access — requires NVIDIA Container Toolkit
     deploy:
       resources:
         reservations:
@@ -14,7 +16,6 @@ services:
               count: all
               capabilities: [gpu]
 
-    # Mount results directory for output persistence
     volumes:
       - ../results:/app/results
       - ../examples/stl_pools:/app/examples/stl_pools:ro
@@ -24,7 +25,6 @@ services:
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
       - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 
-    # Default: calibration phantom
     command: >
       --config configs/config_calibration_phantom_dect.py
       --sim_dir results/calibration_phantom/
