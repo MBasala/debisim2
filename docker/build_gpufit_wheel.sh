@@ -20,7 +20,7 @@ echo "Building gpufit Linux wheel via Docker..."
 docker run --rm --gpus all \
     -v "$PROJECT_ROOT/deps/Gpufit_build:/build/src:ro" \
     -v "$SCRIPT_DIR:/build/out" \
-    nvidia/cuda:13.2.0-devel-ubuntu24.04 \
+    nvidia/cuda:13.1.0-devel-ubuntu24.04 \
     bash -c '
         set -e
         apt-get update -qq && apt-get install -y -qq \

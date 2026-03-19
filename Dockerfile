@@ -17,7 +17,7 @@
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
 
-FROM nvidia/cuda:13.2.0-runtime-ubuntu24.04
+FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
 
 # Prevent interactive prompts during apt install
 ENV DEBIAN_FRONTEND=noninteractive
