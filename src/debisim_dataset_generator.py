@@ -259,7 +259,8 @@ def run_xray_dataset_generator(num_bags,
         del _torch
 
         ctx = mp.get_context('spawn')
-        gpu_queue = ctx.Manager().Queue()
+        mgr = ctx.Manager()
+        gpu_queue = mgr.Queue()
 
         if num_gpus > 0:
             for gid in range(num_gpus):
@@ -298,6 +299,7 @@ def run_xray_dataset_generator(num_bags,
                 except Exception as e:
                     print(f'Failed: {bag_dir} with error: {e}')
 
+        mgr.shutdown()
         print("All bags processed.")
         return
     # --- End parallel path -----------------------------------------------

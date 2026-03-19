@@ -324,7 +324,7 @@ class Object3D(object):
         try:
             bin_data = self.data.copy()//self.label
             erode_elem = ball(self.cntr_thickness)
-            eroded_img = scipy.ndimage.binary_erosion(bin_data, selem=erode_elem)
+            eroded_img = scipy.ndimage.binary_erosion(bin_data, structure=erode_elem)
             e_row, temp1, temp2 = np.where(eroded_img)
             e_fill = int((1 - self.lqd_level) * (e_row.max() - e_row.min()))
             e_fill_img = eroded_img.copy()

@@ -26,11 +26,13 @@ import argparse
 import importlib.util as config_loader
 from datetime import datetime
 
-# Ensure project root is on path and is the working directory
+# Ensure project root is on path and is the working directory.
+# Guarded so that pytest collection does not mutate global state.
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-os.chdir(PROJECT_ROOT)
+if __name__ == '__main__':
+    if PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, PROJECT_ROOT)
+    os.chdir(PROJECT_ROOT)
 
 
 def _sync_gpu():

@@ -810,7 +810,7 @@ class DEBISimPipeline(object):
                       self.reconstruction_geometry['n_views'],
                       self.scanner_geometry['det_col_count'])
         projection_buffer_gpu = torch.zeros(proj_shape, dtype=torch.float32,
-                                            device='cuda')
+                                            device=_gt_device)
 
         # ---- Pre-compute ref_images into RAM (budget-aware) ------------------
         # Pre-computing eliminates per-keV CPU LUT work.  We cap the batch

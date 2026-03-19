@@ -546,11 +546,13 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         ds.BitsStored = 16
         ds.HighBit = 15
         ds.PixelRepresentation = 1  # signed
-        ds.RescaleIntercept = '-1024'
+        ds.RescaleIntercept = '0'
         ds.RescaleSlope = '1'
         ds.RescaleType = 'HU'
 
-        pixel_data = volume_3d[:, :, z].astype(np.int16)
+        # Clip to int16 range before casting to prevent wrap-around
+        slice_data = volume_3d[:, :, z]
+        pixel_data = np.clip(slice_data, -32768, 32767).astype(np.int16)
         ds.PixelData = pixel_data.tobytes()
 
         # --- File Meta ---

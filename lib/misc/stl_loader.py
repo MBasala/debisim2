@@ -218,8 +218,10 @@ def load_mesh_file(file_path, target_voxel_size=None, mm_per_voxel=1.0,
                                 target_voxel_size=target_voxel_size,
                                 mm_per_voxel=mm_per_voxel,
                                 mesh_units=mesh_units)
-    elif lower.endswith('.fits') or lower.endswith('.fits.gz'):
-        return read_fits_data(file_path)
+    elif lower.endswith('.fits.gz'):
+        return read_fits_data(file_path, field=1)
+    elif lower.endswith('.fits'):
+        return read_fits_data(file_path, field=0)
     else:
         raise ValueError(f"Unsupported file format: {file_path}")
 
