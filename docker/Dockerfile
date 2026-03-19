@@ -14,7 +14,7 @@
 # ===========================================================================
 
 # ---- Stage 1: Build gpufit from source ------------------------------------
-FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS gpufit-builder
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS gpufit-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -38,7 +38,7 @@ RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ 
     python3 -m pip wheel . --no-deps -w /wheels/
 
 # ---- Stage 2: Install Python deps into a venv ----------------------------
-FROM nvidia/cuda:13.1.0-base-ubuntu24.04 AS deps-builder
+FROM nvidia/cuda:12.8.1-base-ubuntu24.04 AS deps-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -63,7 +63,7 @@ COPY --from=gpufit-builder /wheels/ /tmp/wheels/
 
 # Install all Python dependencies
 RUN uv pip install --no-cache \
-        torch --index-url https://download.pytorch.org/whl/cu130 && \
+        torch --index-url https://download.pytorch.org/whl/cu128 && \
     uv pip install --no-cache \
         astra-toolbox \
         pyyaml tabulate scikit-image scipy \
@@ -73,7 +73,7 @@ RUN uv pip install --no-cache \
     rm -rf /tmp/wheels
 
 # ---- Stage 3: Slim runtime image -----------------------------------------
-FROM nvidia/cuda:13.1.0-base-ubuntu24.04
+FROM nvidia/cuda:12.8.1-base-ubuntu24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -83,7 +83,7 @@ RUN useradd -m -s /bin/bash debisim
 # Minimal runtime dependencies (no uv, no pip, no -dev)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv \
-        libgomp1 libcublas-13-1 libcusparse-13-1 \
+        libgomp1 libcublas-12-8 libcusparse-12-8 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
