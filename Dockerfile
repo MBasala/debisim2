@@ -34,7 +34,7 @@ RUN mkdir -p build && cd build && \
         -DBUILD_TESTING=OFF && \
     cmake --build . --config Release --parallel $(nproc) && \
     cd Release/pyGpufit && \
-    python3 -m pip wheel . --no-deps -w /build/wheels/
+    python3 -m pip wheel . --no-deps --break-system-packages -w /build/wheels/
 
 # ---- Stage 2: Runtime image -----------------------------------------------
 FROM nvidia/cuda:13.2.0-runtime-ubuntu24.04
@@ -54,8 +54,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd -m -s /bin/bash debisim
 WORKDIR /app
 
-# Install uv for fast dependency resolution
-RUN pip install --no-cache-dir uv
+# Install uv via standalone installer (avoids PEP 668 restriction)
+ADD https://astral.sh/uv/install.sh /tmp/uv-install.sh
+RUN sh /tmp/uv-install.sh && rm /tmp/uv-install.sh
+ENV PATH="/root/.local/bin:$PATH"
+
+# Create venv first (all deps install into it, not system Python)
+RUN uv venv /app/.venv
+ENV VIRTUAL_ENV="/app/.venv"
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy dependency specification first (cache layer)
 COPY pyproject.docker.toml /app/pyproject.toml
@@ -63,16 +70,14 @@ COPY pyproject.docker.toml /app/pyproject.toml
 # Copy gpufit wheel from builder stage
 COPY --from=gpufit-builder /build/wheels/ /app/wheels/
 
-# Install Python dependencies
-RUN uv venv /app/.venv && \
-    . /app/.venv/bin/activate && \
-    uv pip install --no-cache \
+# Install Python dependencies into the venv
+RUN uv pip install --no-cache \
         torch torchvision --index-url https://download.pytorch.org/whl/cu130 && \
     uv pip install --no-cache \
         astra-toolbox \
         pyyaml tabulate scikit-image scikit-learn scipy \
         trimesh tqdm matplotlib pydicom astropy psutil brt \
-        scipy-stubs pyGpufit pytest pytest-mock && \
+        scipy-stubs pytest pytest-mock && \
     uv pip install --no-cache /app/wheels/*.whl && \
     rm -rf /app/wheels
 
@@ -93,7 +98,7 @@ RUN mkdir -p /app/results && chown -R debisim:debisim /app
 # Switch to non-root user
 USER debisim
 
-# Activate venv in shell
+# Ensure venv is on PATH for non-root user
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PYTHONPATH="/app"
 ENV PYTHONUNBUFFERED=1
