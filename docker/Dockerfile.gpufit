@@ -1,0 +1,41 @@
+# ===========================================================================
+# Build pygpufit Linux wheel with custom COMPTON_PE + MATERIAL_BASIS models
+#
+# Usage:
+#   docker build -f docker/Dockerfile.gpufit -t gpufit-builder .
+#   docker run --rm -v $(pwd)/docker:/out gpufit-builder
+#
+# Output: docker/pyGpufit-*.whl
+# ===========================================================================
+
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && apt-get install -y -qq \
+        cmake python3-dev python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deps/Gpufit_build /build/src
+
+WORKDIR /tmp/gpufit_build
+
+# Configure — force modern CUDA architectures only.
+# CUDA 13.x dropped support for sm_53 through sm_72.
+# CUDA_ARCHITECTURES accepts "X.Y" format for CUDA_SELECT_NVCC_ARCH_FLAGS().
+RUN cmake /build/src \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DCUDA_ARCHITECTURES="7.5;8.0;8.6;8.9;9.0"
+
+# Build only the Gpufit target (skip Cpufit)
+RUN cmake --build . --target Gpufit --parallel $(nproc)
+
+# Find and build the Python wheel
+RUN PYDIR=$(find /tmp/gpufit_build -name "setup.py" -path "*/pyGpufit/*" -printf "%h\n" | head -1) && \
+    echo "pyGpufit at: $PYDIR" && \
+    cd "$PYDIR" && \
+    python3 -m pip wheel . --no-deps --break-system-packages -w /wheels/
+
+# Default: copy wheel to mounted /out volume
+CMD ["sh", "-c", "cp /wheels/*.whl /out/ && echo 'Wheel copied to /out:' && ls -la /out/*.whl"]
