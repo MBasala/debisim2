@@ -1,0 +1,79 @@
+{
+  "title": "DEBISim2p5 - Dual Energy Baggage CT Simulator",
+  "description": "GPU-accelerated dual-energy CT baggage simulation pipeline. Generates synthetic X-ray CT datasets with configurable scanner geometry, material composition, and threat object placement using STL meshes. Outputs DICOM CT series with RT-Struct ROI annotations.",
+  "type": "serverless",
+  "category": "image",
+  "config": {
+    "runsOn": "GPU",
+    "containerDiskInGb": 30,
+    "gpuCount": 1,
+    "gpuIds": "AMPERE_48,AMPERE_24,ADA_24",
+    "allowedCudaVersions": ["12.6", "12.5", "12.4", "12.3", "12.2", "12.1"],
+    "env": [
+      {
+        "key": "CONFIG_FILE",
+        "input": {
+          "name": "Configuration",
+          "type": "string",
+          "description": "Path to the simulation config file inside the container",
+          "options": [
+            {
+              "label": "Calibration Phantom (5x5 material grid)",
+              "value": "configs/config_calibration_phantom_dect.py"
+            },
+            {
+              "label": "Default Parallel Beam 3D DECT",
+              "value": "configs/config_default_parallelbeam_3d_dect.py"
+            }
+          ],
+          "default": "configs/config_calibration_phantom_dect.py"
+        }
+      },
+      {
+        "key": "NUM_BAGS",
+        "input": {
+          "name": "Number of bags",
+          "type": "number",
+          "description": "Number of baggage instances to simulate",
+          "min": 1,
+          "max": 100,
+          "default": 1
+        }
+      },
+      {
+        "key": "SIM_DIR",
+        "input": {
+          "name": "Output directory",
+          "type": "string",
+          "description": "Directory inside the container to save simulation results",
+          "default": "results/simulation/",
+          "advanced": true
+        }
+      },
+      {
+        "key": "CUDA_VISIBLE_DEVICES",
+        "value": "0"
+      },
+      {
+        "key": "PYTHONUNBUFFERED",
+        "value": "1"
+      }
+    ],
+    "presets": [
+      {
+        "name": "Calibration Phantom",
+        "defaults": {
+          "CONFIG_FILE": "configs/config_calibration_phantom_dect.py",
+          "NUM_BAGS": 1
+        }
+      },
+      {
+        "name": "Full Baggage Simulation",
+        "defaults": {
+          "CONFIG_FILE": "configs/config_default_parallelbeam_3d_dect.py",
+          "NUM_BAGS": 5
+        }
+      }
+    ]
+  }
+}

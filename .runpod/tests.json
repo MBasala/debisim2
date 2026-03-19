@@ -1,0 +1,48 @@
+{
+  "tests": [
+    {
+      "name": "import_check",
+      "input": {
+        "command": "python -c \"from src.debisim_pipeline import DEBISimPipeline; print('OK')\""
+      },
+      "timeout": 30000
+    },
+    {
+      "name": "cuda_available",
+      "input": {
+        "command": "python -c \"import torch; assert torch.cuda.is_available(), 'No CUDA'; print(f'CUDA {torch.version.cuda} on {torch.cuda.get_device_name(0)}')\""
+      },
+      "timeout": 30000
+    },
+    {
+      "name": "gpufit_available",
+      "input": {
+        "command": "python -c \"import pygpufit.gpufit as gf; print('gpufit OK')\""
+      },
+      "timeout": 30000
+    },
+    {
+      "name": "astra_available",
+      "input": {
+        "command": "python -c \"import astra; print(f'ASTRA {astra.__version__}, GPU: {astra.use_cuda()}')\""
+      },
+      "timeout": 30000
+    },
+    {
+      "name": "calibration_phantom_smoke",
+      "input": {
+        "command": "python run_dataset_generator.py --config configs/config_calibration_phantom_dect.py --sim_dir results/test_smoke/ --num_bags 1"
+      },
+      "timeout": 600000
+    }
+  ],
+  "config": {
+    "gpuTypeId": "NVIDIA RTX A5000",
+    "gpuCount": 1,
+    "allowedCudaVersions": ["12.6", "12.5", "12.4"],
+    "env": [
+      {"key": "CUDA_VISIBLE_DEVICES", "value": "0"},
+      {"key": "PYTHONUNBUFFERED", "value": "1"}
+    ]
+  }
+}

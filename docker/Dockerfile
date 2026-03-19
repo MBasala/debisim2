@@ -7,20 +7,20 @@
 #   Stage 3 (runtime):        slim CUDA base image + venv + app code
 #
 # Build args:
-#   CUDA_VERSION  - CUDA version tag (default: 12.8.1)
-#   TORCH_INDEX   - PyTorch wheel index (default: cu128)
+#   CUDA_VERSION  - CUDA version tag (default: 12.6.3)
+#   TORCH_INDEX   - PyTorch wheel index (default: cu126)
 #
 # Usage:
-#   # CUDA 12.8 (RunPod / cloud compatible):
+#   # CUDA 12.6 (RunPod / cloud compatible — verified CUDA 12.x runtime):
 #   docker compose build
 #
-#   # CUDA 13.1 (local workstation with latest driver):
-#   docker compose build --build-arg CUDA_VERSION=13.1.0 --build-arg TORCH_INDEX=cu130
+#   # CUDA 12.8 (may pull CUDA 13.x due to NVIDIA re-tagging):
+#   docker compose build --build-arg CUDA_VERSION=12.8.1 --build-arg TORCH_INDEX=cu128
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
 
-ARG CUDA_VERSION=12.8.1
+ARG CUDA_VERSION=12.6.3
 
 # ---- Stage 1: Build gpufit from source ------------------------------------
 FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS gpufit-builder
@@ -50,7 +50,7 @@ RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ 
 ARG CUDA_VERSION
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04 AS deps-builder
 
-ARG TORCH_INDEX=cu128
+ARG TORCH_INDEX=cu126
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -77,7 +77,7 @@ RUN uv pip install --no-cache \
         torch --index-url https://download.pytorch.org/whl/${TORCH_INDEX} && \
     uv pip install --no-cache \
         astra-toolbox \
-        pyyaml tabulate scikit-image scipy \
+        pyyaml tabulate scikit-image scikit-learn scipy \
         trimesh tqdm matplotlib pydicom astropy psutil brt \
         scipy-stubs && \
     uv pip install --no-cache /tmp/wheels/*.whl && \
@@ -93,10 +93,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN useradd -m -s /bin/bash debisim
 
 # Minimal runtime dependencies (no uv, no pip, no -dev)
-# Use wildcard for CUDA lib version so it works across 12.x and 13.x
+# PyTorch cu126 wheels bundle their own CUDA runtime (libcublas, libcusparse,
+# etc.) so we do NOT install system CUDA libs — avoids 15+ GB of duplicates.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv \
-        libgomp1 'libcublas-*' 'libcusparse-*' \
+        libgomp1 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
