@@ -166,6 +166,62 @@ class TestFitsAsyncIO:
 
 
 # ===========================================================================
+# FITS: GT label round-trip (integer labels survive float32 storage)
+# ===========================================================================
+
+class TestFitsLabelRoundTrip:
+    """FITS stores data as float32.  GT label images contain integer labels
+    that downstream code (regionprops, torch.where) requires to be integer.
+    These tests verify the save→read→cast pattern works correctly."""
+
+    def test_integer_labels_survive_roundtrip(self, tmp_dir):
+        """Integer labels saved as float32 should be recoverable via .astype(int)."""
+        labels = np.array([[[0, 1, 2], [3, 4, 5]]], dtype=np.int32)
+        fpath = str(tmp_dir / 'gt_labels.fits')
+        save_fits_data(fpath, labels.astype(np.float32))
+        loaded = read_fits_data(fpath, 0)
+        recovered = loaded.astype(np.int32)
+        np.testing.assert_array_equal(recovered, labels)
+
+    def test_fits_returns_float_not_int(self, tmp_dir):
+        """read_fits_data returns float even for integer-valued data —
+        callers must cast explicitly."""
+        labels = np.arange(24, dtype=np.int32).reshape(2, 3, 4)
+        fpath = str(tmp_dir / 'gt_int.fits')
+        save_fits_data(fpath, labels.astype(np.float32))
+        loaded = read_fits_data(fpath, 0)
+        assert np.issubdtype(loaded.dtype, np.floating)
+
+    def test_regionprops_rejects_float_labels(self):
+        """regionprops raises TypeError on float labels — proves the cast
+        is necessary and not just defensive."""
+        from skimage.measure import regionprops
+        float_labels = np.array([[[0, 1], [2, 3]]], dtype=np.float32)
+        with pytest.raises(TypeError, match='Non-integer'):
+            regionprops(float_labels)
+
+    def test_regionprops_accepts_int_labels(self):
+        """regionprops should work after casting to int."""
+        from skimage.measure import regionprops
+        labels = np.zeros((4, 4, 4), dtype=np.int32)
+        labels[1:3, 1:3, 1:3] = 1
+        rprops = regionprops(labels)
+        assert len(rprops) == 1
+        assert rprops[0].label == 1
+
+    def test_large_label_values_survive(self, tmp_dir):
+        """Labels up to ~16M should survive float32 round-trip exactly
+        (float32 has 23 mantissa bits → exact integers up to 2^24)."""
+        labels = np.array([0, 1, 255, 1000, 16_777_216], dtype=np.int32)
+        vol = labels.reshape(1, 1, 5).astype(np.float32)
+        fpath = str(tmp_dir / 'big_labels.fits')
+        save_fits_data(fpath, vol)
+        loaded = read_fits_data(fpath, 0)
+        recovered = loaded.astype(np.int32)
+        np.testing.assert_array_equal(recovered, labels.reshape(1, 1, 5))
+
+
+# ===========================================================================
 # DICOM: series writing
 # ===========================================================================
 

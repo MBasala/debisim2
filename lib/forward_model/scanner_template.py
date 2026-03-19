@@ -1179,7 +1179,7 @@ class ScannerTemplate(object):
         projn = self.run_fwd_projector(vol_np)
         del vol_np
 
-        projn = torch.as_tensor(projn, dtype=torch.float)
+        projn = torch.as_tensor(projn, dtype=getattr(self, 'compute_dtype', torch.float32))
         projn = torch.neg(projn)
         projn = torch.exp(projn)
         return projn
