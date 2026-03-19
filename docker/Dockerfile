@@ -34,8 +34,9 @@ RUN cmake /build/src \
 # Build only Gpufit target (skip Cpufit)
 RUN cmake --build . --target Gpufit --parallel $(nproc)
 
-# Copy built .so next to setup.py and build wheel
-RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/ && \
+# Copy built .so into the pygpufit package directory (setup.py
+# uses package_data to include *.so from pygpufit/)
+RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ && \
     cd /build/src/Gpufit/python && \
     python3 -m pip wheel . --no-deps -w /wheels/
 
