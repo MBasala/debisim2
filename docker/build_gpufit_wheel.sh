@@ -29,12 +29,13 @@ docker run --rm --gpus all \
         mkdir -p /tmp/gpufit_build && cd /tmp/gpufit_build
 
         # Force modern CUDA architectures only — CUDA 13.x dropped
-        # support for sm_53/sm_60/sm_61/sm_70/sm_72.
-        # Override FindCUDA auto-detection via CUDA_NVCC_FLAGS.
+        # support for sm_53 through sm_72.
+        # CUDA_ARCHITECTURES is passed to CUDA_SELECT_NVCC_ARCH_FLAGS()
+        # in Gpufit's CMakeLists.txt — it accepts "X.Y" format strings.
         cmake /build/src \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=OFF \
-            -DCUDA_NVCC_FLAGS="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=compute_90" \
+            -DCUDA_ARCHITECTURES="7.5;8.0;8.6;8.9;9.0" \
             2>&1
 
         # Build only the Gpufit target (skip Cpufit)
