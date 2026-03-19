@@ -1,25 +1,47 @@
 # ===========================================================================
 # DEBISim2 Docker Image
 #
-# Single-stage build using pre-built gpufit wheel (custom COMPTON_PE +
-# MATERIAL_BASIS models compiled locally, copied into the image).
+# Multi-stage build:
+#   Stage 1 (gpufit-builder): compile gpufit from source with CUDA
+#   Stage 2 (runtime): slim CUDA runtime image with Python + all deps
 #
-# NOTE: The gpufit wheel must be pre-built for Linux before building
-#       this image. See deps/gpufit/README.md for build instructions.
-#       Place the wheel at: docker/pyGpufit-linux.whl
-#
-# Usage:
-#   docker build -t debisim2 .
-#   docker run --gpus all -v $(pwd)/results:/app/results debisim2 \
-#       --config configs/config_calibration_phantom_dect.py \
-#       --sim_dir results/phantom/ --num_bags 1
+# Usage (from project root):
+#   cd docker && docker compose build
+#   docker compose run debisim2 --config configs/config_calibration_phantom_dect.py
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
 
+# ---- Stage 1: Build gpufit from source ------------------------------------
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS gpufit-builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -qq && apt-get install -y -qq \
+        cmake python3-dev python3-pip python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY deps/Gpufit_build /build/src
+
+WORKDIR /tmp/gpufit_build
+
+# Force modern CUDA architectures only (CUDA 13.x dropped sm_53-sm_72)
+RUN cmake /build/src \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBUILD_TESTING=OFF \
+        -DCUDA_ARCHITECTURES="7.5;8.0;8.6;8.9;9.0"
+
+# Build only Gpufit target (skip Cpufit)
+RUN cmake --build . --target Gpufit --parallel $(nproc)
+
+# Copy built .so next to setup.py and build wheel
+RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/ && \
+    cd /build/src/Gpufit/python && \
+    python3 -m pip wheel . --no-deps -w /wheels/
+
+# ---- Stage 2: Runtime image -----------------------------------------------
 FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04
 
-# Prevent interactive prompts during apt install
 ENV DEBIAN_FRONTEND=noninteractive
 
 # System dependencies
@@ -46,12 +68,10 @@ ENV VIRTUAL_ENV="/app/.venv"
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy dependency specification first (cache layer)
-COPY pyproject.docker.toml /app/pyproject.toml
+COPY docker/pyproject.docker.toml /app/pyproject.toml
 
-# Copy pre-built gpufit wheel (custom COMPTON_PE + MATERIAL_BASIS models)
-# If no Linux wheel exists yet, the build will still succeed without it
-# (gpufit features will be unavailable at runtime).
-COPY docker/ /app/docker/
+# Copy gpufit wheel from builder stage
+COPY --from=gpufit-builder /wheels/ /tmp/wheels/
 
 # Install Python dependencies into the venv
 RUN uv pip install --no-cache \
@@ -61,9 +81,8 @@ RUN uv pip install --no-cache \
         pyyaml tabulate scikit-image scikit-learn scipy \
         trimesh tqdm matplotlib pydicom astropy psutil brt \
         scipy-stubs pytest pytest-mock && \
-    ( ls /app/docker/*.whl 2>/dev/null && \
-      uv pip install --no-cache /app/docker/*.whl || true ) && \
-    rm -rf /app/docker
+    uv pip install --no-cache /tmp/wheels/*.whl && \
+    rm -rf /tmp/wheels
 
 # Copy application code
 COPY lib/ /app/lib/

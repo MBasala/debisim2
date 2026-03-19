@@ -1,8 +1,8 @@
 services:
   debisim2:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     image: debisim2:latest
 
     # GPU access — requires NVIDIA Container Toolkit
@@ -16,8 +16,8 @@ services:
 
     # Mount results directory for output persistence
     volumes:
-      - ./results:/app/results
-      - ./examples/stl_pools:/app/examples/stl_pools:ro
+      - ../results:/app/results
+      - ../examples/stl_pools:/app/examples/stl_pools:ro
 
     # Override default command with environment variables
     environment:
@@ -34,8 +34,8 @@ services:
   # Run tests
   test:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     deploy:
       resources:
         reservations:
@@ -46,13 +46,13 @@ services:
     entrypoint: ["python", "-m", "pytest"]
     command: ["tests/", "-v", "--tb=short"]
     volumes:
-      - ./results:/app/results
+      - ../results:/app/results
 
   # Run benchmark
   benchmark:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     deploy:
       resources:
         reservations:
@@ -65,5 +65,5 @@ services:
       --config configs/config_calibration_phantom_dect.py
       --sim_dir results/bench_docker/
     volumes:
-      - ./results:/app/results
-      - ./benchmarks/results:/app/benchmarks/results
+      - ../results:/app/results
+      - ../benchmarks/results:/app/benchmarks/results
