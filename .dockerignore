@@ -1,0 +1,50 @@
+# Build artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Results and output (mount as volume instead)
+results/
+*.fits
+*.fits.gz
+*.npy
+*.npz
+
+# Git
+.git/
+.gitignore
+
+# Windows wheels (Linux builds from source)
+*.whl
+
+# Gpufit build artifacts (kept in builder stage only)
+deps/Gpufit_build/build/
+
+# Large test data
+examples/stl_pools/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Claude
+.claude/
+
+# Logs
+*.log

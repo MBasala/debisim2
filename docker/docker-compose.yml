@@ -1,0 +1,31 @@
+services:
+  debisim2p5:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: debisim2p5:latest
+
+    # GPU access — requires NVIDIA Container Toolkit
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Mount results directory for output persistence
+    volumes:
+      - ../results:/app/results
+      - ../examples/stl_pools:/app/examples/stl_pools:ro
+
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+
+    # Default: calibration phantom
+    command: >
+      --config configs/config_calibration_phantom_dect.py
+      --sim_dir results/calibration_phantom/
+      --num_bags 1
