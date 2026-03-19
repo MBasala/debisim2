@@ -16,6 +16,17 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 echo "Building gpufit Linux wheel via Docker..."
+echo "  PROJECT_ROOT: $PROJECT_ROOT"
+echo "  Source: $PROJECT_ROOT/deps/Gpufit_build"
+echo "  Output: $SCRIPT_DIR"
+
+# Verify source exists before launching Docker
+if [ ! -d "$PROJECT_ROOT/deps/Gpufit_build" ]; then
+    echo "ERROR: Gpufit_build not found at $PROJECT_ROOT/deps/Gpufit_build"
+    echo "  Trying Windows path via /mnt/c/..."
+    PROJECT_ROOT="/mnt/c/Users/MBasa/PycharmProjects/debisim2"
+    SCRIPT_DIR="$PROJECT_ROOT/docker"
+fi
 
 docker run --rm --gpus all \
     -v "$PROJECT_ROOT/deps/Gpufit_build:/build/src:ro" \
