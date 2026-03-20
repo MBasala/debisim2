@@ -87,7 +87,7 @@ RUN uv pip install --no-cache \
         astra-toolbox \
         pyyaml tabulate scikit-image scikit-learn scipy \
         trimesh tqdm matplotlib pydicom astropy psutil brt \
-        scipy-stubs runpod && \
+        scipy-stubs && \
     uv pip install --no-cache /tmp/wheels/*.whl && \
     rm -rf /tmp/wheels
 
@@ -126,7 +126,6 @@ COPY --chown=debisim:debisim benchmarks/ /app/benchmarks/
 COPY --chown=debisim:debisim tests/ /app/tests/
 COPY --chown=debisim:debisim run_dataset_generator.py /app/
 COPY --chown=debisim:debisim handler.py /app/
-COPY --chown=debisim:debisim .runpod/ /app/.runpod/
 
 # Results directory
 RUN mkdir -p /app/results && chown debisim:debisim /app/results
