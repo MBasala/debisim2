@@ -8,14 +8,14 @@
 #
 # Build args:
 #   CUDA_VERSION  - CUDA version tag (default: 12.6.3)
-#   TORCH_INDEX   - PyTorch wheel index (default: cu126)
+#   TORCH_INDEX   - PyTorch wheel index (default: cu128)
 #
 # Usage:
-#   # CUDA 12.6 (RunPod / cloud compatible — verified CUDA 12.x runtime):
+#   # Default: CUDA 12.6 base + PyTorch cu128 (supports Ampere through Blackwell):
 #   docker compose build
 #
-#   # CUDA 12.8 (may pull CUDA 13.x due to NVIDIA re-tagging):
-#   docker compose build --build-arg CUDA_VERSION=12.8.1 --build-arg TORCH_INDEX=cu128
+#   # CUDA 12.6 only (no Blackwell/RTX 50-series support):
+#   docker compose build --build-arg TORCH_INDEX=cu126
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
@@ -23,7 +23,10 @@
 ARG CUDA_VERSION=12.6.3
 
 # ---- Stage 1: Build gpufit from source ------------------------------------
-FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS gpufit-builder
+# Builder needs CUDA 12.8 devel for sm_100 (Blackwell) support.
+# Runtime still uses 12.6 base — PyTorch cu128 bundles its own CUDA libs.
+ARG GPUFIT_CUDA_VERSION=12.8.1
+FROM nvidia/cuda:${GPUFIT_CUDA_VERSION}-devel-ubuntu24.04 AS gpufit-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -35,10 +38,15 @@ COPY deps/Gpufit_build /build/src
 
 WORKDIR /tmp/gpufit_build
 
-RUN cmake /build/src \
+# Gpufit uses legacy FindCUDA/CUDA_SELECT_NVCC_ARCH_FLAGS which doesn't
+# know sm_100 (Blackwell).  Replace the broken call with a direct set.
+RUN sed -i \
+        's/CUDA_SELECT_NVCC_ARCH_FLAGS( code_generation_flags "${CUDA_ARCHITECTURES}" )/set( code_generation_flags "" )/' \
+        /build/src/Gpufit/CMakeLists.txt && \
+    cmake /build/src \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF \
-        -DCUDA_ARCHITECTURES="7.5;8.0;8.6;8.9;9.0"
+        -DCUDA_NVCC_FLAGS="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100"
 
 RUN cmake --build . --target Gpufit --parallel $(nproc)
 
@@ -50,7 +58,7 @@ RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ 
 ARG CUDA_VERSION
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04 AS deps-builder
 
-ARG TORCH_INDEX=cu126
+ARG TORCH_INDEX=cu128
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -132,5 +140,7 @@ ENV PYTHONUNBUFFERED=1
 HEALTHCHECK --interval=60s --timeout=10s --retries=3 \
     CMD python -c "from src.debisim_pipeline import DEBISimPipeline; print('OK')"
 
-# RunPod serverless entrypoint (also works standalone via run_dataset_generator.py)
-ENTRYPOINT ["python", "-u", "handler.py"]
+ENTRYPOINT ["python", "run_dataset_generator.py"]
+CMD ["--config", "configs/config_calibration_phantom_dect.py", \
+     "--sim_dir", "results/calibration_phantom/", \
+     "--num_bags", "1"]
