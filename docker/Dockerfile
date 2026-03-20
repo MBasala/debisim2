@@ -125,7 +125,6 @@ COPY --chown=debisim:debisim examples/ /app/examples/
 COPY --chown=debisim:debisim benchmarks/ /app/benchmarks/
 COPY --chown=debisim:debisim tests/ /app/tests/
 COPY --chown=debisim:debisim run_dataset_generator.py /app/
-COPY --chown=debisim:debisim handler.py /app/
 
 # Results directory
 RUN mkdir -p /app/results && chown debisim:debisim /app/results
