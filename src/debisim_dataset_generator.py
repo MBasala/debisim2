@@ -156,8 +156,16 @@ def _process_single_bag(args_tuple):
                 _compress_dicom_dir(simulator.f_loc['image_dir'],
                                     simulator.logger)
 
-        if simulator.logger.hasHandlers():
-            simulator.logger.handlers.clear()
+        for handler in list(simulator.logger.handlers):
+            try:
+                handler.flush()
+            except Exception:
+                pass
+            try:
+                handler.close()
+            except Exception:
+                pass
+            simulator.logger.removeHandler(handler)
         simulator.logger.propagate = False
         simulator.scanner.logger.propagate = False
 
@@ -406,8 +414,16 @@ def run_xray_dataset_generator(num_bags,
 
         res = dict()
 
-        if (simulator.logger.hasHandlers()):
-            simulator.logger.handlers.clear()
+        for handler in list(simulator.logger.handlers):
+            try:
+                handler.flush()
+            except Exception:
+                pass
+            try:
+                handler.close()
+            except Exception:
+                pass
+            simulator.logger.removeHandler(handler)
 
         simulator.logger.propagate = False
         simulator.scanner.logger.propagate = False

@@ -260,7 +260,7 @@ def _calc_z_eff_from_formula(formula, n=3.0):
     return z_sum ** (1.0 / n)
 
 
-def _resolve_z_eff(mat_name, lookup_dict, pe, compton):
+def _resolve_z_eff(mat_name, lookup_dict):
     """Look up Z_eff for a compound/target material.
 
     Priority:
@@ -463,8 +463,7 @@ class MuDatabaseHandler(object):
                 calculate_pe_compton_coeffs(range(10, 10+len(curr_mat['mu'])),
                                             curr_mat['mu'],
                                             density=curr_mat['density'])
-            curr_mat['z'] = _resolve_z_eff(mat, self._compounds_zeff,
-                                          curr_mat['pe'], curr_mat['compton'])
+            curr_mat['z'] = _resolve_z_eff(mat, self._compounds_zeff)
             self.compound[mat] = curr_mat
 
         # Data for target materials
@@ -478,8 +477,7 @@ class MuDatabaseHandler(object):
                 calculate_pe_compton_coeffs(range(10, 10+len(curr_mat['mu'])),
                                             curr_mat['mu'],
                                             density=curr_mat['density'])
-            curr_mat['z'] = _resolve_z_eff(mat, self._targets_zeff,
-                                          curr_mat['pe'], curr_mat['compton'])
+            curr_mat['z'] = _resolve_z_eff(mat, self._targets_zeff)
             self.target[mat] = curr_mat
 
         if self.debug: self.logger.info("Database Contents:")

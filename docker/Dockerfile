@@ -8,14 +8,14 @@
 #
 # Build args:
 #   CUDA_VERSION  - CUDA version tag (default: 12.8.1)
-#   TORCH_INDEX   - PyTorch wheel index (default: cu128)
+#                   TORCH_INDEX is derived automatically from CUDA_VERSION
 #
 # Usage:
-#   # Default: CUDA 12.8 base + PyTorch cu128 (supports Ampere through Blackwell):
+#   # Default: CUDA 12.8 base (supports Ampere through Blackwell):
 #   docker compose build
 #
-#   # CUDA 12.8:
-#   docker compose build --build-arg TORCH_INDEX=cu128
+#   # Override CUDA version:
+#   docker compose build --build-arg CUDA_VERSION=12.6.3
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================

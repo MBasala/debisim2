@@ -498,8 +498,10 @@ class DEBISimPipeline(object):
 
             # Note: The mu database stores mass attenuation coefficients in
             #       cm²/g.  Multiplying by density converts to LAC (cm⁻¹).
-            #       self.scale adjusts units to match the reconstruction path
-            #       (1.0 for FBP_CUDA, 0.1 for legacy BP3D cm→mm conversion).
+            #       self.scale (fixed at 0.1, see __init__) converts cm⁻¹
+            #       to mm⁻¹ for the ASTRA projection geometry.  The inverse
+            #       correction (×10) is applied later via sino_correction
+            #       in run_reconstructor to recover cm⁻¹ for HU conversion.
 
             # the array limits for mu_curve and atten_curve are to ensure
             # they are of the same length, mac value is multiplied by density
