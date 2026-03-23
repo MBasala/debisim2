@@ -4,9 +4,8 @@ services:
       context: ..
       dockerfile: docker/Dockerfile
       args:
-        CUDA_VERSION: ${CUDA_VERSION:-12.6.3}
-        TORCH_INDEX: ${TORCH_INDEX:-cu128}
-    image: fly0ut/debisim2p5:${CUDA_TAG:-cuda12.6}
+        CUDA_VERSION: ${CUDA_VERSION:-12.8.1}
+    image: fly0ut/debisim2p5:${CUDA_TAG:-cuda12.8.1}
 
     deploy:
       resources:

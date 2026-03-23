@@ -999,7 +999,14 @@ class BaggageImage3D(object):
         self.ws_bag     = v_bag     # virtual bag wherein objects are placed
 
         # final bag as output - use this for further processing
-        self.virtual_bag = full_bag_img[ :, :, newaxis]*np.ones(self.img_vol)
+        # full_bag_img is (gantry_dia, gantry_dia) which may differ from
+        # img_vol when pixel_size != 1mm.  Crop/pad to match img_vol[:2].
+        fbg = full_bag_img
+        if fbg.shape[0] != self.img_vol[0] or fbg.shape[1] != self.img_vol[1]:
+            from skimage.transform import resize
+            fbg = resize(fbg, (self.img_vol[0], self.img_vol[1]),
+                         order=0, preserve_range=True, anti_aliasing=False)
+        self.virtual_bag = fbg[:, :, newaxis] * np.ones(self.img_vol)
 
         if logfile is None: logfile = os.path.join(sim_dir, 
                                                    'virtual_bag_creator.log')
@@ -1088,17 +1095,20 @@ class BaggageImage3D(object):
                                    block_size=30, gap=20):
         """
         -----------------------------------------------------------------------
-        Create a deterministic 2D grid of labelled cuboid blocks for
+        Create a deterministic 2D grid of labelled cylinders for
         calibration / algorithm testing.
 
-        Each block is a homogeneous material cube placed at a fixed position
-        in the XY plane (single layer in Z).  No bag boundary is generated.
+        Each insert is a homogeneous material cylinder (circular XY cross-
+        section, extruded along Z) placed at a fixed position in the XY
+        plane.  Cylinders are the standard calibration shape because they
+        eliminate corner streak artifacts and provide rotationally invariant
+        beam hardening.  No bag boundary is generated.
 
         :param materials:   ordered list of material names
                             (length must equal grid[0] * grid[1])
         :param grid:        (rows, cols) grid dimensions
-        :param block_size:  side length of each cube in voxels
-        :param gap:         spacing between cubes in voxels
+        :param block_size:  diameter of each cylinder in voxels
+        :param gap:         spacing between cylinders in voxels
         :return:            None — mutates self.ws_bag, self.param_file,
                             and self.virtual_bag in place
         -----------------------------------------------------------------------
@@ -1116,22 +1126,53 @@ class BaggageImage3D(object):
         self.bg_sf_list = []
         self.param_file = []
 
-        # Grid layout centred in the working volume
+        # Grid layout centred in the working volume.
+        # The final image is cropped from ws_bag to img_vol dimensions, so
+        # blocks must fit within the cropped region, not the full ws_bag.
+        crop_x = self.img_vol[0] if self.img_vol[0] < self.size else self.size
+        crop_y = self.img_vol[1] if self.img_vol[1] < self.size else self.size
+
+        # Auto-shrink block_size and gap if the grid doesn't fit.
         total_x = rows * block_size + (rows - 1) * gap
         total_y = cols * block_size + (cols - 1) * gap
+        margin = 2  # minimum voxel margin from volume edge
+
+        usable_x = crop_x - 2 * margin
+        usable_y = crop_y - 2 * margin
+        usable = builtins.min(usable_x, usable_y)
+
+        if total_x > usable or total_y > usable:
+            max_extent = builtins.max(total_x, total_y)
+            scale = usable / max_extent
+            block_size = builtins.max(2, int(block_size * scale))
+            gap = builtins.max(1, int(gap * scale))
+            total_x = rows * block_size + (rows - 1) * gap
+            total_y = cols * block_size + (cols - 1) * gap
+            self.logger.info(
+                f"Grid too large for cropped volume ({crop_x}x{crop_y}), "
+                f"auto-scaled: block={block_size}, gap={gap}")
 
         ctr = self.size // 2
         start_x = ctr - total_x // 2
         start_y = ctr - total_y // 2
-        z_start = ctr - block_size // 2   # single layer centred in Z
+        # Z must be centred within img_vol[2] (not self.size) because
+        # virtual_bag is cropped to [:img_vol[2]] at finalisation.
+        z_ctr = self.img_vol[2] // 2
+        z_start = z_ctr - block_size // 2
 
         obj_list = []
         label = self.bb_label + 1         # labels start after bag boundary (3)
         self.start_label = label
 
+        # Pre-compute circular mask for cylinder cross-section
+        radius = block_size / 2.0
+        yy, xx = np.meshgrid(np.arange(block_size), np.arange(block_size))
+        circle_mask = ((xx - radius + 0.5) ** 2 +
+                       (yy - radius + 0.5) ** 2) <= radius ** 2
+
         self.logger.info(
             f"Creating calibration phantom: {rows}x{cols} grid, "
-            f"block={block_size}, gap={gap}")
+            f"diameter={block_size}, gap={gap}")
 
         for r in range(rows):
             for c in range(cols):
@@ -1141,15 +1182,15 @@ class BaggageImage3D(object):
                 py = start_y + c * (block_size + gap)
                 pz = z_start
 
-                # Place block directly into ws_bag — bypasses add_object's
-                # dim//2 convention which doesn't match Box data shape.
-                self.ws_bag[px:px + block_size,
-                            py:py + block_size,
-                            pz:pz + block_size] = label
+                # Place cylinder (circular XY mask extruded along Z)
+                for zi in range(block_size):
+                    self.ws_bag[px:px + block_size,
+                                py:py + block_size,
+                                pz + zi][circle_mask] = label
 
                 # Build a minimal obj_dict for sf_obj_list / DICOM output
                 obj_dict = dict(
-                    shape='B',
+                    shape='B',  # display as box (center/dim/rot) metadata
                     label=label,
                     material=mat,
                     geom=dict(center=array([px, py, pz]),

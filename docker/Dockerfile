@@ -7,26 +7,22 @@
 #   Stage 3 (runtime):        slim CUDA base image + venv + app code
 #
 # Build args:
-#   CUDA_VERSION  - CUDA version tag (default: 12.6.3)
-#   TORCH_INDEX   - PyTorch wheel index (default: cu128)
+#   CUDA_VERSION  - CUDA version tag (default: 12.8.1)
+#                   TORCH_INDEX is derived automatically from CUDA_VERSION
 #
 # Usage:
-#   # Default: CUDA 12.6 base + PyTorch cu128 (supports Ampere through Blackwell):
+#   # Default: CUDA 12.8 base (supports Ampere through Blackwell):
 #   docker compose build
 #
-#   # CUDA 12.6 only (no Blackwell/RTX 50-series support):
-#   docker compose build --build-arg TORCH_INDEX=cu126
+#   # Override CUDA version:
+#   docker compose build --build-arg CUDA_VERSION=12.6.3
 #
 # Requires: NVIDIA Container Toolkit (nvidia-docker2)
 # ===========================================================================
 
-ARG CUDA_VERSION=12.6.3
+ARG CUDA_VERSION=12.8.1
 
-# ---- Stage 1: Build gpufit from source ------------------------------------
-# Builder needs CUDA 12.8 devel for sm_100 (Blackwell) support.
-# Runtime still uses 12.6 base — PyTorch cu128 bundles its own CUDA libs.
-ARG GPUFIT_CUDA_VERSION=12.8.1
-FROM nvidia/cuda:${GPUFIT_CUDA_VERSION}-devel-ubuntu24.04 AS gpufit-builder
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu24.04 AS gpufit-builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -39,14 +35,15 @@ COPY deps/Gpufit_build /build/src
 WORKDIR /tmp/gpufit_build
 
 # Gpufit uses legacy FindCUDA/CUDA_SELECT_NVCC_ARCH_FLAGS which doesn't
-# know sm_100 (Blackwell).  Replace the broken call with a direct set.
+# know sm_100+ (Blackwell).  Replace the broken call with a direct set.
+# sm_120 = RTX 5090/5080 (Blackwell consumer), sm_100 = Blackwell data center
 RUN sed -i \
         's/CUDA_SELECT_NVCC_ARCH_FLAGS( code_generation_flags "${CUDA_ARCHITECTURES}" )/set( code_generation_flags "" )/' \
         /build/src/Gpufit/CMakeLists.txt && \
     cmake /build/src \
         -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=OFF \
-        -DCUDA_NVCC_FLAGS="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100"
+        -DCUDA_NVCC_FLAGS="-gencode arch=compute_75,code=sm_75 -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90 -gencode arch=compute_100,code=sm_100 -gencode arch=compute_120,code=sm_120"
 
 RUN cmake --build . --target Gpufit --parallel $(nproc)
 
@@ -58,7 +55,7 @@ RUN cp /tmp/gpufit_build/Gpufit/libGpufit.so /build/src/Gpufit/python/pygpufit/ 
 ARG CUDA_VERSION
 FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu24.04 AS deps-builder
 
-ARG TORCH_INDEX=cu128
+ENV CUDA_VERSION=$CUDA_VERSION
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -67,7 +64,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ln -sf /usr/bin/python3.12 /usr/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/bin/python
 
-# Install uv (only needed in this stage)
 ADD https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-unknown-linux-gnu.tar.gz /tmp/uv.tar.gz
 RUN tar -xzf /tmp/uv.tar.gz -C /usr/local/bin --strip-components=1 && \
     rm /tmp/uv.tar.gz
@@ -80,16 +76,18 @@ ENV PATH="/app/.venv/bin:$PATH"
 # Copy gpufit wheel from stage 1
 COPY --from=gpufit-builder /wheels/ /tmp/wheels/
 
-# Install all Python dependencies
-RUN uv pip install --no-cache \
-        torch --index-url https://download.pytorch.org/whl/${TORCH_INDEX} && \
+# Copy dependency manifest
+COPY docker/pyproject.docker.toml /tmp/pyproject.toml
+
+# Install all Python dependencies from pyproject.docker.toml
+# torch is installed first with the CUDA-specific index, then the rest
+# from the manifest (torch is already satisfied so uv skips it).
+RUN export TORCH_INDEX=cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d .) && \
     uv pip install --no-cache \
-        astra-toolbox \
-        pyyaml tabulate scikit-image scikit-learn scipy \
-        trimesh tqdm matplotlib pydicom astropy psutil brt \
-        scipy-stubs && \
+        torch --index-url https://download.pytorch.org/whl/${TORCH_INDEX} && \
+    uv pip install --no-cache -r /tmp/pyproject.toml && \
     uv pip install --no-cache /tmp/wheels/*.whl && \
-    rm -rf /tmp/wheels
+    rm -rf /tmp/wheels /tmp/pyproject.toml
 
 # ---- Stage 3: Slim runtime image -----------------------------------------
 ARG CUDA_VERSION
@@ -101,8 +99,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN useradd -m -s /bin/bash debisim
 
 # Minimal runtime dependencies (no uv, no pip, no -dev)
-# PyTorch cu126 wheels bundle their own CUDA runtime (libcublas, libcusparse,
-# etc.) so we do NOT install system CUDA libs — avoids 15+ GB of duplicates.
+# PyTorch cuxxx wheels bundle their own CUDA runtime.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.12 python3.12-venv \
         libgomp1 \
@@ -125,7 +122,6 @@ COPY --chown=debisim:debisim examples/ /app/examples/
 COPY --chown=debisim:debisim benchmarks/ /app/benchmarks/
 COPY --chown=debisim:debisim tests/ /app/tests/
 COPY --chown=debisim:debisim run_dataset_generator.py /app/
-COPY --chown=debisim:debisim handler.py /app/
 
 # Results directory
 RUN mkdir -p /app/results && chown debisim:debisim /app/results

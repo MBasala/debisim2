@@ -20,6 +20,7 @@ dependencies = [
     "pydicom",
     "astropy",
     "psutil",
+    "xraydb",
     "pytest",
     "pytest-mock",
 ]

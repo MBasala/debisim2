@@ -36,3 +36,8 @@ torchvision = [
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: tests that require pre-computed pipeline output (deselect with '-m not slow')",
+]

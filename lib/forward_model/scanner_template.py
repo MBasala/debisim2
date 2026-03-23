@@ -110,8 +110,12 @@ import scipy.io as io
 
 from lib.reconstructor.freect import *
 import torch, torch.nn as nn
-from numpy import *
-from tabulate import *
+import numpy as np
+from numpy import (zeros, ones, array, linspace, arange, concatenate, reshape,
+                   tile, transpose, moveaxis, dstack, hstack, repeat, squeeze,
+                   ceil, floor, sin, cos, arcsin, exp, deg2rad, mod,
+                   pi, newaxis, float32, float64, ndarray)
+from tabulate import tabulate
 
 import lib.forward_model.template_siemens_definition_as as siemens_definition_as
 import lib.forward_model.template_siemens_force as siemens_force
@@ -597,20 +601,32 @@ class ScannerTemplate(object):
                                                 self.recon_geometry['angles']
                                                 )
 
-        # Generate Ram-Lak filter sized to the actual detector column count
-        # rather than loading from a fixed-size .mat file.
+        # Generate Ram-Lak (ramp) filter sized to the actual detector column
+        # count.  The filter is a symmetric V-shaped ramp in frequency domain:
+        #   |freq_bin| / (N/2), peaking at 1.0 at Nyquist (bin N/2).
+        # This matches the original ramlak.mat shipped with DEBISim.
         # Shape: (n_det, n_views) — matching the original .mat format.
         n_det = self.machine_geometry['det_col_count']
         n_views = self.recon_geometry['n_views']
-        ramlak_1d = np.zeros(n_det, dtype=np.float64)
-        ramlak_1d[0] = 0.25
-        for k in range(1, n_det):
-            if k % 2 == 1:
-                ramlak_1d[k] = -1.0 / (np.pi * k) ** 2
-        ramlak_freq = np.fft.fft(ramlak_1d)
-        # Tile to (n_det, n_views) to match the original filter shape
+        half = n_det // 2
+        # Frequency-domain ramp filter |ω|, symmetric, length = n_det.
+        if n_det <= 1:
+            ramlak_1d = np.zeros(1, dtype=np.float64)
+        elif n_det % 2 == 0:
+            # Even: [0, 1/half, ..., 1, ..., 2/half, 1/half]  length = 2*half = n_det
+            ramlak_1d = np.concatenate([
+                np.arange(0, half + 1, dtype=np.float64),
+                np.arange(half - 1, 0, -1, dtype=np.float64)
+            ]) / half
+        else:
+            # Odd: [0, 1/half, ..., 1, ..., 1/half]  length = 2*half + 1 = n_det
+            ramlak_1d = np.concatenate([
+                np.arange(0, half + 1, dtype=np.float64),
+                np.arange(half, 0, -1, dtype=np.float64)
+            ]) / half
+        # Tile to (n_det, n_views) — all views use the same filter
         self.ramlak = np.tile(
-            ramlak_freq[:, np.newaxis], (1, n_views)
+            ramlak_1d[:, np.newaxis], (1, n_views)
         ).astype(complex)
     # -------------------------------------------------------------------------
 
@@ -956,49 +972,52 @@ class ScannerTemplate(object):
 
         elif len(sino.shape)==3:
 
+            # Input sino shape after run_fwd_model's moveaxis+flip:
+            #   (det_cols, det_rows, n_views)
+            # Reorder to (det_rows, n_views, det_cols) for filtering + ASTRA
             sino = transpose(sino, (1, 2, 0))
             assert sino.shape == (self.machine_geometry['det_row_count'],
                                   self.recon_params['n_views'],
-                                  self.machine_geometry['det_col_count'])
+                                  self.machine_geometry['det_col_count']), \
+                f"Sinogram shape {sino.shape} != expected " \
+                f"({self.machine_geometry['det_row_count']}, " \
+                f"{self.recon_params['n_views']}, " \
+                f"{self.machine_geometry['det_col_count']})"
 
-            vol_geom = astra.create_vol_geom(*self.recon_geometry['image_dims'])
+            # Reconstruct slice-by-slice using ASTRA's built-in FBP_CUDA
+            # which correctly applies Ram-Lak filtering + backprojection.
+            # sino shape: (det_rows, n_views, det_cols)
+            n_rows = sino.shape[0]
+            im_dims = self.recon_geometry['image_dims']
 
-            if verbose: self.logger.info("Starting reconstruction...")
+            rec = np.zeros((im_dims[0], im_dims[1], n_rows),
+                           dtype=np.float32)
 
-            sino = moveaxis(sino, -1, 0)
-            sino_freq = np.fft.fft(sino, axis=0)  # FFT
-            filtered_freq = self.ramlak[:,newaxis,:] * sino_freq  # use ram-lak filter
-            filtered_sino = np.fft.ifft(filtered_freq, axis=0)  # IFFT
-            n_det = self.machine_geometry['det_col_count']
-            filtered_sino = np.real(filtered_sino[0:n_det, :])
+            proj_geom2d = astra.create_proj_geom(
+                'parallel',
+                self.machine_geometry['det_spacing_y'],
+                self.machine_geometry['det_col_count'],
+                self.recon_geometry['angles']
+            )
+            im_geom = astra.create_vol_geom(im_dims[0], im_dims[1])
 
-            sino = moveaxis(filtered_sino, 0, -1)
-
-            sino_id = astra.data3d.create('-sino', self.proj_geom, sino)
-            rec_id = astra.data3d.create('-vol', vol_geom)
-
-            # create configuration
-            cfg = astra.astra_dict('BP3D_CUDA')
-            # cfg = astra.astra_dict('CGLS3D_CUDA')
-            cfg['ReconstructionDataId'] = rec_id
-            cfg['ProjectionDataId'] = sino_id
-
-            # Create and run the algorithm object from the configuration structure
-            alg_id = astra.algorithm.create(cfg)
-            self.logger.info("Starting reconstruction...")
+            self.logger.info(
+                f"Starting slice-by-slice FBP: {n_rows} slices, "
+                f"image {im_dims[0]}x{im_dims[1]} ...")
             t0 = time.time()
-            astra.algorithm.run(alg_id)
 
-            # Get the result
-            rec = astra.data3d.get(rec_id)
+            # Create projector once and reuse across all slices
+            proj_id = astra.create_projector('cuda', proj_geom2d, im_geom)
+            w = astra.OpTomo(proj_id)
 
-            # Clean up. Note that GPU memory is tied up in the algorithm object,
-            # and main RAM in the data objects.
-            astra.algorithm.delete(alg_id)
-            astra.data3d.delete(rec_id)
-            astra.data3d.delete(sino_id)
+            for row in range(n_rows):
+                sino_2d = sino[row, :, :]  # (n_views, det_cols)
+                rec[:, :, row] = w.reconstruct('FBP_CUDA', sino_2d)
 
-            rec = rec*1e-2
+            astra.projector.delete(proj_id)
+
+            # Transpose to match expected output: (n_rows, im_x, im_y)
+            rec = np.moveaxis(rec, -1, 0)
 
             if verbose: self.logger.info("Reconstruction took %.2fs" % (time.time() - t0))
             torch.cuda.empty_cache()
@@ -1376,11 +1395,12 @@ def create_parallel_scanner(gantry_diameter_mm=512,
         # Ram-Lak filter is generated dynamically in set_recon_geometry()
         # based on det_col_count — no static file needed.
         ramlak=None,
-        # img_scale compensates for the detector pixel pitch in the
-        # FBP backprojection.  Must be 1/det_spacing_y so that the
-        # reconstructed LAC values are physically correct regardless
-        # of pixel_size_mm.
-        img_scale=1.0 / det_spacing_y,
+        # ASTRA's FBP_CUDA returns values in correct LAC units
+        # regardless of det_spacing_y, so no additional scaling is
+        # needed.  (The upstream img_scale=1/det_spacing_y was a
+        # compensation for the manual Ram-Lak + BP3D path which
+        # produced values scaled by det_spacing_y.)
+        img_scale=1.0,
         # mu_w=None forces the pipeline to compute water LAC from the
         # actual X-ray spectra instead of using stale hardcoded values.
         mu_w=None,

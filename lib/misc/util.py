@@ -1,8 +1,9 @@
+import sys
 import matplotlib as mpl
-
-# mpl.use('TkAgg')
-from pylab import *
-from numpy import *
+import matplotlib.pyplot as plt
+import numpy as np
+from numpy import *  # noqa: F401,F403 - intentional wildcard re-export
+from numpy.linalg import eigh
 
 import os, pickle, pydicom, logging, logging.handlers
 import scipy.sparse as sp
@@ -17,9 +18,102 @@ from skimage.measure import regionprops
 from skimage.transform import rescale
 
 from lib.__init__ import *
+from sys import stdout as stdout
 from lib.misc.multi_processor import *
 from PIL import Image
 import imageio
+
+
+class DicomCoordinateMapper:
+    """Centralizes coordinate transforms between DEBISim internal volumes
+    and DICOM pixel/patient coordinate space.
+
+    DEBISim stores volumes as [X, Y, Z].
+    DICOM stores pixel arrays as [row, col] with orientation defined by
+    ImageOrientationPatient (IOP).
+
+    With IOP [1,0,0, 0,1,0]:
+      - Row direction = patient +X
+      - Column direction = patient +Y
+      - The viewer affine maps: col → patient X, row → patient Y
+      - Therefore pixel_array[row, col] = data[Y_idx, X_idx]
+      - A .T transpose converts [X, Y] → [Y, X] for storage
+
+    This class owns these operations:
+      1. volume_slice_to_pixels() — for DICOM CT series writing
+      2. voxel_to_patient()       — for RT-Struct contour generation
+
+    All transforms are derived from the same IOP and pixel_spacing,
+    so they stay consistent automatically.
+    """
+
+    # Standard axial orientation: row=+X, col=+Y
+    IOP = [1, 0, 0, 0, 1, 0]
+
+    def __init__(self, pixel_spacing=(1.0, 1.0), slice_thickness=1.0,
+                 origin=(0.0, 0.0, 0.0)):
+        self.pixel_spacing = tuple(float(p) for p in pixel_spacing)
+        self.slice_thickness = float(slice_thickness)
+        self.origin = tuple(float(o) for o in origin)
+        # Row spacing = ps[0], Col spacing = ps[1]
+        # With IOP [1,0,0,0,1,0]: col→X uses ps[1], row→Y uses ps[0]
+        # but pydicom PixelSpacing is [row_spacing, col_spacing]
+        self._ps_row = self.pixel_spacing[0]
+        self._ps_col = self.pixel_spacing[1]
+
+    def volume_slice_to_pixels(self, vol_slice_xy):
+        """Convert a [X, Y] volume slice to DICOM pixel array [row=Y, col=X].
+
+        Parameters
+        ----------
+        vol_slice_xy : ndarray, shape (nx, ny)
+            A 2D slice from the internal volume (X along axis 0, Y along axis 1).
+
+        Returns
+        -------
+        pixel_data : ndarray, shape (ny, nx)
+            Transposed and clipped to int16 for DICOM storage.
+        """
+        return np.clip(vol_slice_xy.T, -32768, 32767).astype(np.int16)
+
+    def pixel_rows_cols(self, vol_slice_xy):
+        """Return (Rows, Columns) for the DICOM header after transpose."""
+        return vol_slice_xy.shape[1], vol_slice_xy.shape[0]  # (ny, nx)
+
+    def voxel_to_patient(self, row_idx, col_idx, z_idx):
+        """Convert GT volume indices (X=row_idx, Y=col_idx, Z=z_idx)
+        to DICOM patient coordinates (x_mm, y_mm, z_mm).
+
+        The GT volume is indexed as [X, Y, Z].  find_contours on
+        gt[:, :, z] returns (row, col) = (X_idx, Y_idx).
+
+        With IOP [1,0,0, 0,1,0], the viewer affine maps:
+          patient X = origin_x + col_idx * ps_col   (col tracks X)
+          patient Y = origin_y + row_idx * ps_row   (row tracks Y)
+
+        But our contour (row, col) from find_contours on [X, Y] gives
+        row=X_idx, col=Y_idx.  So:
+          patient X = X_idx * ps_row   (from the first axis)
+          patient Y = Y_idx * ps_col   (from the second axis)
+        """
+        x_mm = float(row_idx) * self._ps_row + self.origin[0]
+        y_mm = float(col_idx) * self._ps_col + self.origin[1]
+        z_mm = float(z_idx) * self.slice_thickness + self.origin[2]
+        return x_mm, y_mm, z_mm
+
+    def image_position_patient(self, z_idx):
+        """Return ImagePositionPatient for a given slice index."""
+        return [self.origin[0], self.origin[1],
+                self.origin[2] + z_idx * self.slice_thickness]
+
+    def dicom_tags(self):
+        """Return a dict of orientation-related DICOM tags."""
+        return dict(
+            ImageOrientationPatient=list(self.IOP),
+            PixelSpacing=list(self.pixel_spacing),
+            SliceThickness=str(self.slice_thickness),
+            SpacingBetweenSlices=str(self.slice_thickness),
+        )
 
 
 class Logger(object):
@@ -103,7 +197,7 @@ def get_logger(lname, logfile):
         target=f_handler,
     )
 
-    s_handler = logging.StreamHandler(sys.stdout)
+    s_handler = logging.StreamHandler(stdout)
 
     # Create formatter
     formatter = logging.Formatter(
@@ -160,7 +254,7 @@ def quick_imshow(nrows, ncols=1,
             figsize = (s * ncols, s * nrows)
 
     if nrows == ncols == 1:
-        f, ax = subplots(figsize=figsize)
+        f, ax = plt.subplots(figsize=figsize)
         cax = ax.imshow(images, cmap=colormap, vmax=vmax, vmin=vmin)
         if colorbar:
             f.colorbar(cax, ax=ax)
@@ -172,7 +266,7 @@ def quick_imshow(nrows, ncols=1,
         cax.axes.get_yaxis().set_visible(visibleaxis)
         return f, ax, cax
 
-    f, axes = subplots(nrows, ncols, figsize=figsize)
+    f, axes = plt.subplots(nrows, ncols, figsize=figsize)
     caxes = []
     i = 0
     for ax, img in zip(axes.flat, images):
@@ -249,8 +343,8 @@ def update_subplots(images,
             cbar.set_clim([vmin, vmax])
         cbar.update_normal(caxes[ind])
 
-    pause(0.01)
-    tight_layout()
+    plt.pause(0.01)
+    plt.tight_layout()
 # ------------------------------------------------------------------------------
 
 
@@ -302,7 +396,7 @@ def scatter_ellipse(X, labels, mu, R, figsize=(5, 5), s=0.01, alpha=0.1):
     """
     k = len(unique(labels))
 
-    f, ax = subplots(figsize=figsize)
+    f, ax = plt.subplots(figsize=figsize)
     ax.scatter(X[:, 0], X[:, 1],
                s=s, c=labels, alpha=alpha, cmap='jet')
 
@@ -478,11 +572,18 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
     det_cols = scan_metadata.get('det_col_count', '')
     gantry_diam = scan_metadata.get('gantry_diameter', '')
     num_views = scan_metadata.get('num_views', '')
+    view_range = scan_metadata.get('view_range', '')
     dosage = scan_metadata.get('dosage', '')
     recon_algo = scan_metadata.get('recon_algo', 'FBP')
     fov = scan_metadata.get('fov', '')
     anode_angle = scan_metadata.get('anode_angle', '')
     image_dims = scan_metadata.get('image_dims', [])
+    num_spectra = scan_metadata.get('num_spectra', 1)
+    det_spacing_x = scan_metadata.get('det_spacing_x', '')
+    det_spacing_y = scan_metadata.get('det_spacing_y', '')
+    dosage_list = scan_metadata.get('dosage_list', [])
+    spectra_files = scan_metadata.get('spectra_files', [])
+    img_scale = scan_metadata.get('img_scale', '')
 
     for z in range(num_slices):
         sop_uid = uid.generate_uid()
@@ -526,47 +627,87 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         if kvp != '':
             ds.KVP = str(kvp)
         if dosage != '':
-            ds.XRayTubeCurrent = str(int(float(dosage)))
-            ds.Exposure = str(int(float(dosage)))
+            # Dosage is in photon counts — store as Exposure (mAs equivalent).
+            # XRayTubeCurrent is mA; for simulation, report dosage in a
+            # meaningful way: photon count goes into Exposure, mA is left
+            # proportional (dosage / n_views approximates mAs).
+            n_v = int(num_views) if num_views != '' else 1
+            mAs = float(dosage) / (n_v if n_v > 0 else 1)
+            ds.XRayTubeCurrent = str(int(round(mAs)))
+            ds.Exposure = f'{float(dosage):.0f}'
+            ds.ExposureInuAs = int(float(dosage))  # total photon count
         if src_to_iso != '':
-            ds.DistanceSourceToPatient = str(float(src_to_iso))
+            ds.DistanceSourceToPatient = f'{float(src_to_iso):.1f}'
         if src_to_det != '' and src_to_iso != '':
-            ds.DistanceSourceToDetector = str(float(src_to_iso) + float(src_to_det))
+            ds.DistanceSourceToDetector = f'{float(src_to_iso) + float(src_to_det):.1f}'
         if gantry_diam != '':
-            ds.ReconstructionDiameter = str(float(gantry_diam))
-            ds.DataCollectionDiameter = str(float(gantry_diam))
+            ds.DataCollectionDiameter = f'{float(gantry_diam):.1f}'
         if fov != '':
-            ds.ReconstructionDiameter = str(float(fov))
+            ds.ReconstructionDiameter = f'{float(fov):.1f}'
+        elif gantry_diam != '':
+            ds.ReconstructionDiameter = f'{float(gantry_diam):.1f}'
+
+        # Detector geometry
         if det_rows != '':
-            ds.NumberOfDetectorRows = str(det_rows)
+            ds.NumberOfDetectorRows = int(det_rows)
         if det_cols != '':
-            ds.NumberOfDetectorColumns = str(det_cols)
-        # Note: anode_angle is not stored — DICOM FocalSpotSize is a physical
-        # size (mm), not an angle.  NumberOfFrames is omitted because each
-        # file is a single-frame CT slice.
-        ds.ConvolutionKernel = str(recon_algo)
-        ds.FilterType = str(recon_algo)
+            ds.NumberOfDetectorColumns = int(det_cols)
+
+        # Reconstruction parameters
+        ds.ConvolutionKernel = str(recon_algo).upper()
+        ds.FilterType = 'RAM-LAK'
         ds.ContentDate = date_str
 
-        # Geometry info in private/protocol tags
-        ds.AcquisitionType = str(geometry).upper()
+        # Acquisition geometry — map DEBISim geometry names to valid DICOM values
+        _geom_to_dicom = {'PARALLEL': 'SEQUENCED', 'CONE': 'SPIRAL',
+                          'FANBEAM': 'SEQUENCED'}
+        ds.AcquisitionType = _geom_to_dicom.get(
+            str(geometry).upper(), 'SEQUENCED')
         ds.ScanOptions = str(scan_type).upper()
+        ds.GantryDetectorTilt = '0.0'
+        ds.RotationDirection = 'CW'
+        ds.TableHeight = '0.0'
+
+        # Angular sampling
+        if num_views != '':
+            ds.NumberOfProjections = int(num_views)
+        if view_range != '':
+            ds.ScanArc = f'{float(view_range):.1f}'
+
+        # Spacing between slices (DICOM viewers need this for contiguous check)
+        ds.SpacingBetweenSlices = str(slice_thickness)
+
+        # Dual-energy metadata — store as private tags so downstream
+        # algorithms can detect DECT and find the companion series.
+        if num_spectra > 1:
+            ds.add_new([0x0009, 0x0010], 'LO', 'DEBISim2_DECT')
+            ds.add_new([0x0009, 0x1001], 'IS', str(num_spectra))
+            if spectra_files:
+                ds.add_new([0x0009, 0x1002], 'LO',
+                           ', '.join(spectra_files))
+            if dosage_list:
+                ds.add_new([0x0009, 0x1003], 'LO',
+                           ', '.join(f'{d:.0f}' for d in dosage_list))
+            if img_scale != '':
+                ds.add_new([0x0009, 0x1004], 'DS', f'{float(img_scale):.6f}')
 
         # Window center/width for typical CT display
         ds.WindowCenter = '40'
         ds.WindowWidth = '400'
 
         # --- Image Pixel Module ---
-        ds.ImagePositionPatient = [0.0, 0.0, float(z * slice_thickness)]
-        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
-        ds.PixelSpacing = list(pixel_spacing)
-        ds.SliceThickness = str(slice_thickness)
+        # All coordinate transforms are handled by DicomCoordinateMapper
+        # to keep pixel data, IOP, and contour generation consistent.
+        coord = DicomCoordinateMapper(pixel_spacing, slice_thickness)
+        dicom_tags = coord.dicom_tags()
+        ds.ImagePositionPatient = coord.image_position_patient(z)
+        ds.ImageOrientationPatient = dicom_tags['ImageOrientationPatient']
+        ds.PixelSpacing = dicom_tags['PixelSpacing']
+        ds.SliceThickness = dicom_tags['SliceThickness']
         ds.SliceLocation = str(z * slice_thickness)
 
         ds.SamplesPerPixel = 1
         ds.PhotometricInterpretation = 'MONOCHROME2'
-        ds.Rows = volume_3d.shape[0]
-        ds.Columns = volume_3d.shape[1]
         ds.BitsAllocated = 16
         ds.BitsStored = 16
         ds.HighBit = 15
@@ -575,9 +716,11 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         ds.RescaleSlope = '1'
         ds.RescaleType = 'HU'
 
-        # Clip to int16 range before casting to prevent wrap-around
-        slice_data = volume_3d[:, :, z]
-        pixel_data = np.clip(slice_data, -32768, 32767).astype(np.int16)
+        vol_slice = volume_3d[:, :, z]
+        rows, cols = coord.pixel_rows_cols(vol_slice)
+        ds.Rows = rows
+        ds.Columns = cols
+        pixel_data = coord.volume_slice_to_pixels(vol_slice)
         ds.PixelData = pixel_data.tobytes()
 
         # --- File Meta ---
@@ -610,7 +753,8 @@ _ROI_COLORS = {
 
 def create_rtstruct(output_path, roi_list, gt_label_volume,
                     ct_series_uids, pixel_spacing=(1.0, 1.0),
-                    slice_thickness=1.0, patient_id='DEBISim'):
+                    slice_thickness=1.0, patient_id='DEBISim',
+                    recon_volume=None):
     """
     Create a DICOM RT-Structure Set file with ROI contours for threats.
 
@@ -674,6 +818,17 @@ def create_rtstruct(output_path, roi_list, gt_label_volume,
 
     num_slices = gt_label_volume.shape[2]
 
+    # Only emit contours on slices where the reconstruction has content.
+    # This prevents contours from extending beyond the FBP valid range.
+    if recon_volume is not None:
+        _content_thresh = -990  # HU above air
+        _valid_slices = set()
+        for z in range(num_slices):
+            if recon_volume[:, :, z].max() > _content_thresh:
+                _valid_slices.add(z)
+    else:
+        _valid_slices = set(range(num_slices))
+
     for roi_num, roi in enumerate(roi_list, start=1):
         label = roi['label']
         category = roi.get('category', 'unknown')
@@ -694,17 +849,20 @@ def create_rtstruct(output_path, roi_list, gt_label_volume,
         contour_seq = []
 
         for z in range(num_slices):
+            if z not in _valid_slices:
+                continue
             mask_slice = (gt_label_volume[:, :, z] == label).astype(np.uint8)
             if mask_slice.sum() == 0:
                 continue
             contours = find_contours(mask_slice, 0.5)
+            coord = DicomCoordinateMapper(pixel_spacing, slice_thickness)
             for contour in contours:
-                # Convert pixel coords (row, col) to patient coords (x, y, z)
+                # Convert GT voxel indices to patient coords via the
+                # shared DicomCoordinateMapper (same transform used
+                # by save_dicom_series for pixel data).
                 contour_data = []
                 for row, col in contour:
-                    x = col * pixel_spacing[1]
-                    y = row * pixel_spacing[0]
-                    z_pos = z * slice_thickness
+                    x, y, z_pos = coord.voxel_to_patient(row, col, z)
                     contour_data.extend([x, y, z_pos])
 
                 c_item = Dataset()
@@ -838,10 +996,13 @@ def save_dicom_output(image_dir, recon_images, gt_label_volume,
 
     if len(roi_list) > 0:
         rtstruct_path = os.path.join(dicom_dir, 'rtstruct.dcm')
+        # Use the first recon volume to clip contours to valid FBP slices
+        ref_recon = next(iter(recon_images.values()), None)
         create_rtstruct(
             rtstruct_path, roi_list, gt_label_volume,
             ct_uids, pixel_spacing=pixel_spacing,
-            slice_thickness=slice_thickness
+            slice_thickness=slice_thickness,
+            recon_volume=ref_recon,
         )
 
         # Save a human-readable ROI manifest (CSV) alongside the DICOM files

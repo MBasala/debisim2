@@ -191,14 +191,109 @@ materials_list              - list of all saved materials including elements,
 --------------------------------------------------------------------------------
 """
 
-import sys, os
+import sys, os, time
 import builtins
+import logging
+import warnings
 
 from lib.misc.fdlib import *
 from lib.misc.util import *
 from lib.misc.ctlib import *
 import numpy as np
 import subprocess as sub
+
+_log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Chemical formulas for compounds and targets used in Z_eff fallback
+# calculation.  Only needed when a material is missing from the reference
+# lookup files (compounds_zeff.txt / targets_zeff.txt).
+# ---------------------------------------------------------------------------
+_COMPOUND_FORMULAS = {
+    'air':          'N1.562O0.42Ar0.009',
+    'water':        'H2O',
+    'acetal':       'CH2O',
+    'neoprene':     'C4H5Cl',
+    'polyethylene': 'C2H4',
+    'polystyrene':  'C8H8',
+    'pyrex':        'Si2B0.5Na0.15Al0.08O5.5',
+    'salt':         'NaCl',
+    'bone':         'Ca5P3O13H',
+    'acrylic':      'C5H8O2',
+    'teflon':       'C2F4',
+    'pvc':          'C2H3Cl',
+    'polyester':    'C10H8O4',
+    'nylon6':       'C6H11NO',
+    'bakelite':     'C7H8O2',
+    'ethanol':      'C2H6O',
+    'H2O2':         'H2O2',
+}
+# Saline solutions: H2O + NaCl at varying concentrations
+for _pct in ['035','050','060','070','080','090','100','110','120','130','140','150']:
+    _frac = int(_pct) / 10000.0
+    _COMPOUND_FORMULAS[f'saline{_pct}'] = f'H2ONa{_frac:.4f}Cl{_frac:.4f}'
+
+
+def _calc_z_eff_from_formula(formula, n=3.0):
+    """Compute Z_eff from a chemical formula using the electron-fraction
+    power-law method with xraydb for element parsing.
+
+    Z_eff = (sum_i  f_i * Z_i^n) ^ (1/n)
+
+    where f_i is the electron fraction of element i.
+    """
+    try:
+        import xraydb
+    except ImportError:
+        return None
+
+    parsed = xraydb.chemparse(formula)
+    total_electrons = sum(cnt * xraydb.atomic_number(sym)
+                          for sym, cnt in parsed.items())
+    if total_electrons == 0:
+        return None
+
+    z_sum = sum((cnt * xraydb.atomic_number(sym) / total_electrons)
+                * xraydb.atomic_number(sym) ** n
+                for sym, cnt in parsed.items())
+    return z_sum ** (1.0 / n)
+
+
+def _resolve_z_eff(mat_name, lookup_dict):
+    """Look up Z_eff for a compound/target material.
+
+    Priority:
+      1. Reference lookup file (compounds_zeff.txt / targets_zeff.txt)
+      2. xraydb formula-based calculation
+      3. Log warning — should never reach here in normal use
+    """
+    if mat_name in lookup_dict:
+        return lookup_dict[mat_name]
+
+    # Fallback: compute from chemical formula via xraydb
+    formula = _COMPOUND_FORMULAS.get(mat_name)
+    if formula is not None:
+        z = _calc_z_eff_from_formula(formula)
+        if z is not None:
+            warnings.warn(
+                f"Z_eff for '{mat_name}' not in reference file — "
+                f"computed {z:.4f} from formula '{formula}'. "
+                f"Add it to the appropriate *_zeff.txt file.",
+                stacklevel=3,
+            )
+            _log.warning("Z_eff for '%s' computed from formula (%.4f). "
+                          "Add to reference file.", mat_name, z)
+            return z
+
+    # Last resort: unknown formula, unknown material
+    warnings.warn(
+        f"Z_eff for '{mat_name}' could not be determined — no reference "
+        f"value and no known formula. Using NaN.",
+        stacklevel=3,
+    )
+    _log.warning("Z_eff for '%s' is unknown — returning NaN.", mat_name)
+    return float('nan')
 
 
 class MuDatabaseHandler(object):
@@ -242,6 +337,8 @@ class MuDatabaseHandler(object):
         'elements_density': os.path.join(ROOT_DIR,'include/mu/elements_density.txt'),
         'compounds_density': os.path.join(ROOT_DIR,'include/mu/compounds_density.txt'),
         'targets_density': os.path.join(ROOT_DIR,'include/mu/targets_density.txt'),
+        'compounds_zeff': os.path.join(ROOT_DIR,'include/mu/compounds_zeff.txt'),
+        'targets_zeff': os.path.join(ROOT_DIR,'include/mu/targets_zeff.txt'),
         'xcom_setup': 'gfortran XCOM.f',
         'xcom_run': './a.out'
     }
@@ -311,6 +408,21 @@ class MuDatabaseHandler(object):
         self.targets_name   =   loadtxt(self.f_loc['targets_density'],
                                             dtype=dtype(str, float))[:, 0]
 
+        # Load reference Z_eff values (computed from elemental composition
+        # using the power-law method with n=3.0, via xraydb/NIST data)
+        self._compounds_zeff = {}
+        if os.path.isfile(self.f_loc['compounds_zeff']):
+            _zdata = np.loadtxt(self.f_loc['compounds_zeff'],
+                               dtype=np.dtype([('name', 'U32'), ('z', float)]))
+            for row in _zdata:
+                self._compounds_zeff[str(row[0])] = float(row[1])
+        self._targets_zeff = {}
+        if os.path.isfile(self.f_loc['targets_zeff']):
+            _zdata = np.loadtxt(self.f_loc['targets_zeff'],
+                               dtype=np.dtype([('name', 'U32'), ('z', float)]))
+            for row in _zdata:
+                self._targets_zeff[str(row[0])] = float(row[1])
+
         self.metals = self.elements_list[2:4] + self.elements_list[10:13] + \
                       self.elements_list[18:31] + self.elements_list[36:50] + \
                       self.elements_list[54:83] + self.elements_list[87:]
@@ -351,8 +463,7 @@ class MuDatabaseHandler(object):
                 calculate_pe_compton_coeffs(range(10, 10+len(curr_mat['mu'])),
                                             curr_mat['mu'],
                                             density=curr_mat['density'])
-            curr_mat['z'] = effective_atomic_number(curr_mat['pe'],
-                                                    curr_mat['compton'])
+            curr_mat['z'] = _resolve_z_eff(mat, self._compounds_zeff)
             self.compound[mat] = curr_mat
 
         # Data for target materials
@@ -366,8 +477,7 @@ class MuDatabaseHandler(object):
                 calculate_pe_compton_coeffs(range(10, 10+len(curr_mat['mu'])),
                                             curr_mat['mu'],
                                             density=curr_mat['density'])
-            curr_mat['z'] = effective_atomic_number(curr_mat['pe'],
-                                                    curr_mat['compton'])
+            curr_mat['z'] = _resolve_z_eff(mat, self._targets_zeff)
             self.target[mat] = curr_mat
 
         if self.debug: self.logger.info("Database Contents:")
@@ -683,7 +793,16 @@ class MuDatabaseHandler(object):
     def calculate_lac_hu_values(self, mat, spectrum_list):
         """
         -----------------------------------------------------------------------
-        Calculate the LAC and HU values for the given material and spectrum
+        Calculate the LAC and HU values for the given material and spectrum.
+
+        Uses energy-weighted LAC to match the forward model energy loop
+        which weights each keV bin by ``spectrum[i] * e`` (detector energy
+        response).  The thin-sample LAC is:
+
+            LAC = sum(w_e * mu_e * rho) / sum(w_e)
+
+        where w_e = spectrum[e] * e.  This produces HU values consistent
+        with the reconstructed image.
 
         :param mat:             material name
         :param spectrum_list:   spectrum array or list of 1D spectra
@@ -695,6 +814,8 @@ class MuDatabaseHandler(object):
             """
             -----------------------------------------------------
             Sets LAC / HU for given material and spectrum.
+            Uses energy-weighted formula matching the forward
+            model accumulation loop.
 
             :param cmat:    material
             :param spec:    1D spectrum
@@ -703,34 +824,44 @@ class MuDatabaseHandler(object):
             -----------------------------------------------------
             """
 
+            def _energy_weighted_lac(mu_arr, density, spec_arr):
+                """Compute LAC using energy-weighted spectrum.
+
+                The forward model (debisim_pipeline.py line 903) weights
+                each keV bin by spectrum[i] * e, where e is the energy in
+                keV (starting from 10 keV at index 0).  The HU reference
+                LAC must use the same weighting for consistency.
+                """
+                s_len = builtins.min(spec_arr.size, mu_arr.size)
+                energies = np.arange(10, 10 + s_len, dtype=np.float64)
+                weights = spec_arr[:s_len].astype(np.float64) * energies
+                w_sum = weights.sum()
+                if w_sum == 0:
+                    return 0.0
+                return float(np.sum(
+                    weights * mu_arr[:s_len].astype(np.float64) * density
+                ) / w_sum)
+
             if cmat in self.element.keys():
-
-                s_len = builtins.min(spec.size, self.element[cmat]['mu'].size)
-
-                self.element[cmat]['lac%s'%k] =  -log(sum(spec[:s_len]*
-                                                    exp(-self.element[cmat]['mu'][:s_len]
-                                                         *self.element[cmat]['density'])))
+                self.element[cmat]['lac%s'%k] = _energy_weighted_lac(
+                    self.element[cmat]['mu'],
+                    self.element[cmat]['density'], spec)
 
                 self.element[cmat]['HU%s'%k] = (self.element[cmat]['lac%s'%k]
                 - self.compound['water']['lac%s'%k])/self.compound['water']['lac%s'%k]*1000
 
             elif cmat in self.compound.keys():
-
-                s_len = builtins.min(spec.size, self.compound[cmat]['mu'].size)
-
-                self.compound[cmat]['lac%s'%k] = -log(sum(spec[:s_len]*
-                                                    exp(-self.compound[cmat]['mu'][:s_len]
-                                                         *self.compound[cmat]['density'])))
+                self.compound[cmat]['lac%s'%k] = _energy_weighted_lac(
+                    self.compound[cmat]['mu'],
+                    self.compound[cmat]['density'], spec)
 
                 self.compound[cmat]['HU%s'%k] = (self.compound[cmat]['lac%s'%k]
                 - self.compound['water']['lac%s'%k])/self.compound['water']['lac%s'%k]*1000
 
             elif cmat in self.target.keys():
-                s_len = builtins.min(spec.size, self.target[cmat]['mu'].size)
-
-                self.target[cmat]['lac%s'%k] = -log(sum(spec[:s_len]*
-                                                    exp(-self.target[cmat]['mu'][:s_len]
-                                                         *self.target[cmat]['density'])))
+                self.target[cmat]['lac%s'%k] = _energy_weighted_lac(
+                    self.target[cmat]['mu'],
+                    self.target[cmat]['density'], spec)
 
                 self.target[cmat]['HU%s'%k] = (self.target[cmat]['lac%s'%k]
                 - self.compound['water']['lac%s'%k])/self.compound['water']['lac%s'%k]*1000

@@ -354,8 +354,10 @@ class DEDecomposer(object):
         ------------------------------------------------------------------------
         """
 
-        Kp = 1 / 2.501
+        # Kp adjusted for normalized PE basis: PE(e) = (E_ref/e)^3
+        E_ref = 60.0
         n = 3.5
+        Kp = (1.0 / 2.501) * E_ref ** (3.0 / n)
         img_p = maximum(img_p, 0)
         img_c = maximum(img_c, 0)
         img_z = zeros(img_c.shape)
