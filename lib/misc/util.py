@@ -620,10 +620,12 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         ds.RescaleSlope = '1'
         ds.RescaleType = 'HU'
 
-        # DICOM pixel_array convention: row=Y, col=X.
-        # The reconstruction volume is stored as [X, Y, Z], so transpose
-        # the slice to [Y, X] before writing.
-        slice_data = volume_3d[:, :, z].T
+        # The volume is stored as [X, Y, Z].  With IOP [1,0,0, 0,1,0],
+        # DICOM row direction = +X and column direction = +Y, so
+        # pixel_array[row, col] = volume[X, Y] — no transpose needed.
+        # The RT-Struct contour generator uses the same convention
+        # (row→X, col→Y) so contours align with pixel data.
+        slice_data = volume_3d[:, :, z]
         ds.Rows = slice_data.shape[0]
         ds.Columns = slice_data.shape[1]
         pixel_data = np.clip(slice_data, -32768, 32767).astype(np.int16)
