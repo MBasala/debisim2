@@ -609,11 +609,21 @@ class ScannerTemplate(object):
         n_det = self.machine_geometry['det_col_count']
         n_views = self.recon_geometry['n_views']
         half = n_det // 2
-        # Frequency-domain ramp: [0, 1/half, 2/half, ..., 1, ..., 2/half, 1/half]
-        ramlak_1d = np.concatenate([
-            np.arange(0, half + 1, dtype=np.float64),
-            np.arange(half - 1, 0, -1, dtype=np.float64)
-        ]) / half
+        # Frequency-domain ramp filter |ω|, symmetric, length = n_det.
+        if n_det <= 1:
+            ramlak_1d = np.zeros(1, dtype=np.float64)
+        elif n_det % 2 == 0:
+            # Even: [0, 1/half, ..., 1, ..., 2/half, 1/half]  length = 2*half = n_det
+            ramlak_1d = np.concatenate([
+                np.arange(0, half + 1, dtype=np.float64),
+                np.arange(half - 1, 0, -1, dtype=np.float64)
+            ]) / half
+        else:
+            # Odd: [0, 1/half, ..., 1, ..., 1/half]  length = 2*half + 1 = n_det
+            ramlak_1d = np.concatenate([
+                np.arange(0, half + 1, dtype=np.float64),
+                np.arange(half, 0, -1, dtype=np.float64)
+            ]) / half
         # Tile to (n_det, n_views) — all views use the same filter
         self.ramlak = np.tile(
             ramlak_1d[:, np.newaxis], (1, n_views)
@@ -996,12 +1006,15 @@ class ScannerTemplate(object):
                 f"image {im_dims[0]}x{im_dims[1]} ...")
             t0 = time.time()
 
+            # Create projector once and reuse across all slices
+            proj_id = astra.create_projector('cuda', proj_geom2d, im_geom)
+            w = astra.OpTomo(proj_id)
+
             for row in range(n_rows):
                 sino_2d = sino[row, :, :]  # (n_views, det_cols)
-                proj_id = astra.create_projector('cuda', proj_geom2d, im_geom)
-                w = astra.OpTomo(proj_id)
                 rec[:, :, row] = w.reconstruct('FBP_CUDA', sino_2d)
-                astra.projector.delete(proj_id)
+
+            astra.projector.delete(proj_id)
 
             # Transpose to match expected output: (n_rows, im_x, im_y)
             rec = np.moveaxis(rec, -1, 0)

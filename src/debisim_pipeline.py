@@ -1519,7 +1519,7 @@ class DEBISimPipeline(object):
         """
 
         # reconstruct images from the sinograms
-        if recon is not 'fbp':
+        if recon != 'fbp':
             self.scanner.update_recon_algo(recon)
 
         # The energy loop stores sinograms in self.scale units (mm⁻¹

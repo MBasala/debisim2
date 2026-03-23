@@ -339,20 +339,24 @@ class CDMDecomposer(DEDecomposer):
             GFtol = 1e-4
             GFmaxIter = 100
 
-            # Auto-estimate initial values from sinogram statistics.
+            # Auto-estimate initial values from sinogram statistics when
+            # the user-provided init_val is near zero (default/unset).
             # With normalized PE basis (PE(60)=1.0) and KN(60)≈1.09,
             # both parameters are on the same scale as the sinogram values.
-            # Sinograms should be in cm⁻¹ (after decomp_scale in pipeline).
-            pos_h = sino_h[sino_h > 0.01]
-            pos_l = sino_l[sino_l > 0.01]
-            mean_sino = ((np.mean(pos_h) if pos_h.size else 0.5) +
-                         (np.mean(pos_l) if pos_l.size else 0.5)) / 2
-            # Compton dominates at diagnostic energies (~80% of LAC)
-            auto_c = np.float32(np.maximum(mean_sino * 0.8, 0.05))
-            auto_p = np.float32(np.maximum(mean_sino * 0.2, 0.01))
-            self.init_val = array([auto_p, auto_c])
-            print(f"  Auto init_val: PE={auto_p:.4f}, Compton={auto_c:.4f}, "
-                  f"mean_sino={mean_sino:.3f}")
+            user_init = np.array(self.init_val, dtype=np.float32)
+            if np.all(np.abs(user_init) < 0.01):
+                pos_h = sino_h[sino_h > 0.01]
+                pos_l = sino_l[sino_l > 0.01]
+                mean_sino = ((np.mean(pos_h) if pos_h.size else 0.5) +
+                             (np.mean(pos_l) if pos_l.size else 0.5)) / 2
+                auto_c = np.float32(np.maximum(mean_sino * 0.8, 0.05))
+                auto_p = np.float32(np.maximum(mean_sino * 0.2, 0.01))
+                self.init_val = array([auto_p, auto_c])
+                print(f"  Auto init_val: PE={auto_p:.4f}, Compton={auto_c:.4f}, "
+                      f"mean_sino={mean_sino:.3f}")
+            else:
+                print(f"  User init_val: PE={user_init[0]:.4f}, "
+                      f"Compton={user_init[1]:.4f}")
             # User info
             GFui = concatenate((
                 [scc, scp],

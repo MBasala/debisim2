@@ -1,8 +1,8 @@
+import sys
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
-from numpy import (arange, ndarray, uint8, unique, sqrt, arctan2, degrees,
-                   newaxis)
+from numpy import *  # noqa: F401,F403 - intentional wildcard re-export
 from numpy.linalg import eigh
 
 import os, pickle, pydicom, logging, logging.handlers
@@ -566,8 +566,11 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         ds.FilterType = 'RAM-LAK'
         ds.ContentDate = date_str
 
-        # Acquisition geometry
-        ds.AcquisitionType = str(geometry).upper()
+        # Acquisition geometry — map DEBISim geometry names to valid DICOM values
+        _geom_to_dicom = {'PARALLEL': 'SEQUENCED', 'CONE': 'SPIRAL',
+                          'FANBEAM': 'SEQUENCED'}
+        ds.AcquisitionType = _geom_to_dicom.get(
+            str(geometry).upper(), 'SEQUENCED')
         ds.ScanOptions = str(scan_type).upper()
         ds.GantryDetectorTilt = '0.0'
         ds.RotationDirection = 'CW'
@@ -609,8 +612,6 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
 
         ds.SamplesPerPixel = 1
         ds.PhotometricInterpretation = 'MONOCHROME2'
-        ds.Rows = volume_3d.shape[0]
-        ds.Columns = volume_3d.shape[1]
         ds.BitsAllocated = 16
         ds.BitsStored = 16
         ds.HighBit = 15
@@ -623,6 +624,8 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         # The reconstruction volume is stored as [X, Y, Z], so transpose
         # the slice to [Y, X] before writing.
         slice_data = volume_3d[:, :, z].T
+        ds.Rows = slice_data.shape[0]
+        ds.Columns = slice_data.shape[1]
         pixel_data = np.clip(slice_data, -32768, 32767).astype(np.int16)
         ds.PixelData = pixel_data.tobytes()
 

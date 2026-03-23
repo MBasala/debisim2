@@ -191,7 +191,7 @@ materials_list              - list of all saved materials including elements,
 --------------------------------------------------------------------------------
 """
 
-import sys, os
+import sys, os, time
 import builtins
 import logging
 import warnings
@@ -412,14 +412,14 @@ class MuDatabaseHandler(object):
         # using the power-law method with n=3.0, via xraydb/NIST data)
         self._compounds_zeff = {}
         if os.path.isfile(self.f_loc['compounds_zeff']):
-            _zdata = loadtxt(self.f_loc['compounds_zeff'],
-                             dtype=dtype(str, float))
+            _zdata = np.loadtxt(self.f_loc['compounds_zeff'],
+                               dtype=np.dtype([('name', 'U32'), ('z', float)]))
             for row in _zdata:
                 self._compounds_zeff[str(row[0])] = float(row[1])
         self._targets_zeff = {}
         if os.path.isfile(self.f_loc['targets_zeff']):
-            _zdata = loadtxt(self.f_loc['targets_zeff'],
-                             dtype=dtype(str, float))
+            _zdata = np.loadtxt(self.f_loc['targets_zeff'],
+                               dtype=np.dtype([('name', 'U32'), ('z', float)]))
             for row in _zdata:
                 self._targets_zeff[str(row[0])] = float(row[1])
 
