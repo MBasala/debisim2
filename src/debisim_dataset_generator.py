@@ -81,7 +81,7 @@ def _process_single_bag(args_tuple):
     (bag_dir, scanner_init_args, xray_src_mdl, bag_creator_args,
      fwd_mdl_args, decomposer, decomposer_args, basis_fn,
      save_sino, recon_args, images_to_save, slicewise,
-     compress_data, dicom_output) = payload
+     compress_data, dicom_output, compress_dicom) = payload
 
     # ---- Acquire a free GPU ------------------------------------------------
     gpu_id = gpu_queue.get()          # blocks until a GPU is available
@@ -152,6 +152,9 @@ def _process_single_bag(args_tuple):
 
         if dicom_output:
             simulator.save_dicom_output()
+            if compress_dicom:
+                _compress_dicom_dir(simulator.f_loc['image_dir'],
+                                    simulator.logger)
 
         if simulator.logger.hasHandlers():
             simulator.logger.handlers.clear()
@@ -169,6 +172,19 @@ def _process_single_bag(args_tuple):
 # -----------------------------------------------------------------------------
 
 
+def _compress_dicom_dir(image_dir, logger=None):
+    """Compress the dicom/ subfolder into dicom.zip and remove the original."""
+    import shutil
+    dicom_dir = os.path.join(image_dir, 'dicom')
+    if not os.path.isdir(dicom_dir):
+        return
+    zip_path = os.path.join(image_dir, 'dicom')  # shutil adds .zip
+    shutil.make_archive(zip_path, 'zip', root_dir=image_dir, base_dir='dicom')
+    shutil.rmtree(dicom_dir)
+    if logger:
+        logger.info("DICOM compressed to %s.zip" % zip_path)
+
+
 def run_xray_dataset_generator(num_bags,
                                sim_dir,
                                scanner,
@@ -184,7 +200,8 @@ def run_xray_dataset_generator(num_bags,
                                compress_data=False,
                                fwd_mdl_args=None,
                                num_workers=1,
-                               dicom_output=False
+                               dicom_output=False,
+                               compress_dicom=False
 ):
     """
     ---------------------------------------------------------------------------
@@ -286,7 +303,7 @@ def run_xray_dataset_generator(num_bags,
             (bag_dir, scanner_init_args, xray_src_mdl, bag_creator_args,
              fwd_mdl_args, decomposer, decomposer_args, basis_fn,
              save_sino, recon_args, images_to_save, slicewise,
-             compress_data, dicom_output, gpu_queue)
+             compress_data, dicom_output, compress_dicom, gpu_queue)
             for bag_dir in bag_dirs
         ]
 
@@ -383,6 +400,9 @@ def run_xray_dataset_generator(num_bags,
 
         if dicom_output:
             simulator.save_dicom_output()
+            if compress_dicom:
+                _compress_dicom_dir(simulator.f_loc['image_dir'],
+                                    simulator.logger)
 
         res = dict()
 

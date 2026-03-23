@@ -87,7 +87,7 @@ decomp_method = 'cdm'
 cdm_args = dict(cdm_solver='gpu',
                 cdm_type='cpd',
                 projector='gpu',
-                init_val=(0, 0))
+                init_val=(0.1, 0.1))
 # -----------------------------------------------------------------------------
 
 # Assemble params dictionary

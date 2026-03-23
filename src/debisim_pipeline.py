@@ -285,11 +285,9 @@ class DEBISimPipeline(object):
 
         # ---------------------------------------------------------------------
 
-        # self.image_shape_3d = self.scanner.recon_params['image_dims']
-
-        self.image_shape_3d = (int(self.scanner_geometry['gantry_diameter']),
-                               int(self.scanner_geometry['gantry_diameter']),
-                               int(self.scanner.recon_params['image_dims'][2]))
+        self.image_shape_3d = tuple(
+            int(d) for d in self.scanner.recon_params['image_dims']
+        )
 
         self.slh = ShapeListHandle()
         self.mu = MuDatabaseHandler(self.debug, self.logfile) \
@@ -312,7 +310,29 @@ class DEBISimPipeline(object):
 
         header = ['CT Specifications', '']
 
-        self.scale = 0.1 # self.scanner.recon_params['img_scale']
+        # LAC unit scaling for the forward model energy loop.
+        #
+        # The mu database stores mass attenuation coefficients in cm²/g.
+        # Multiplying by density gives LAC in cm⁻¹.
+        #
+        # self.scale is ALWAYS 0.1 (cm⁻¹ → mm⁻¹) in the mu_curve that
+        # feeds the energy loop.  This keeps the projection values in a
+        # range where exp(-proj) produces meaningful photon counts for the
+        # Poisson noise model (system_gain=2.5e-3 was calibrated for this).
+        #
+        # img_scale (applied after FBP) converts the reconstruction back
+        # to physical LAC units for HU conversion.  Their product must
+        # produce correct LAC:
+        #
+        #   mu_curve = mu(cm²/g) × density(g/cm³) × 0.1
+        #   recon_lac = FBP(sinogram) × img_scale
+        #   HU = (recon_lac - mu_w) / mu_w × 1000
+        #
+        # For img_scale=1.0 (FBP_CUDA), self.scale=0.1 means the FBP
+        # output is in mm⁻¹.  The sinogram post-processing then scales
+        # by (1 / self.scale) to convert back to cm⁻¹ before saving.
+        #
+        self.scale = 0.1  # always cm→mm for noise model compatibility
 
         print_table = []
 
@@ -362,6 +382,12 @@ class DEBISimPipeline(object):
         # bag_vol_shape[2] = max(bag_vol_shape[2], 350)
 
         if not slicewise:
+            # BaggageImage3D.gantry_dia controls the bag boundary polygon
+            # and ws_bag working volume size.  It expects the same units as
+            # img_vol (voxels), but upstream hardcoded offsets assume ~512.
+            # Pass gantry_diameter_mm here (matches upstream's assumption
+            # that pixel_size=1mm) — the ws_bag is oversized but gets
+            # cropped to img_vol at finalization.
             virtual_bag_creator = BaggageImage3D(img_vol=tuple(bag_vol_shape),
                                                  sim_dir=self.f_loc['gt_dir'],
                                                  logfile=self.logfile,
@@ -470,9 +496,10 @@ class DEBISimPipeline(object):
 
             atten_curve =  curr_material['mu']  # original unscaled atten. curve
 
-            # Note: The original attenuation curve has mac values in units of
-            #       ((1/cm) / (g/cc) = cm^2/g) - the volume though is in units
-            #       of mm therefore the coeffs are scaled down by 0.1 (self.scale)
+            # Note: The mu database stores mass attenuation coefficients in
+            #       cm²/g.  Multiplying by density converts to LAC (cm⁻¹).
+            #       self.scale adjusts units to match the reconstruction path
+            #       (1.0 for FBP_CUDA, 0.1 for legacy BP3D cm→mm conversion).
 
             # the array limits for mu_curve and atten_curve are to ensure
             # they are of the same length, mac value is multiplied by density
@@ -914,6 +941,12 @@ class DEBISimPipeline(object):
         projection_buffer_gpu.log_()
         projection_buffer_gpu.neg_()
         projection_buffer_gpu.add_(log(pc_sum))
+
+        # NOTE: The sinogram is stored in self.scale units (mm⁻¹ when
+        # self.scale=0.1).  The correction to cm⁻¹ is applied later in
+        # run_reconstructor() — NOT here — because the CDM decomposer
+        # expects sinograms in the same units the energy loop produced.
+
         projection_buffer = projection_buffer_gpu.cpu().numpy()
         del projection_buffer_gpu
 
@@ -1039,7 +1072,7 @@ class DEBISimPipeline(object):
         self.mu.calculate_lac_hu_values('water', spectra)
         mu_w = self.mu.material('water')
         cmin, cmax, offset = -1000, 3.2e4, 0
-        scale = 10 #self.scanner.recon_params['img_scale']
+        scale = self.scanner.recon_params['img_scale']
 
         self.scatter_recon *= scale
         self.scatter_recon = \
@@ -1443,13 +1476,19 @@ class DEBISimPipeline(object):
             sino_c  = zeros_like(self.data2)
             nrows   = self.data1.shape[1]
 
+            # The decomposer's basis functions (Klein-Nishina, PE=e^-3)
+            # are defined for LAC in cm⁻¹.  Convert sinograms from
+            # self.scale units (mm⁻¹) to cm⁻¹ before decomposition.
+            decomp_scale = 1.0 / self.scale if abs(self.scale - 1.0) > 1e-6 else 1.0
+
             for i in range(nrows):
                 self.logger.info("Row %d:" % i)
                 cdm_sim.init_val = decomposer_args['init_val']
                 # try:
                 sino_pe[:, i, :], sino_c[:, i, :] = \
                     cdm_sim.decompose_dect_sinograms(
-                        self.data1[:, i, :], self.data2[:, i, :],
+                        self.data1[:, i, :] * decomp_scale,
+                        self.data2[:, i, :] * decomp_scale,
                         solver=decomposer_args['cdm_solver'],
                         type=decomposer_args['cdm_type']
                     )
@@ -1483,23 +1522,29 @@ class DEBISimPipeline(object):
         if recon is not 'fbp':
             self.scanner.update_recon_algo(recon)
 
+        # The energy loop stores sinograms in self.scale units (mm⁻¹
+        # when self.scale=0.1) for noise model compatibility.
+        # Convert to cm⁻¹ before reconstruction so that FBP × img_scale
+        # produces correct LAC for HU conversion.
+        sino_correction = 1.0 / self.scale if abs(self.scale - 1.0) > 1e-6 else 1.0
+
         if self.xray_source_model['num_spectra']==2:
-            image_1 = self.scanner.reconstruct_data(self.data1,
-                                                    full_range=True,
-                                                    append_air_turns=True)
+            image_1 = self.scanner.reconstruct_data(
+                self.data1 * sino_correction,
+                full_range=True, append_air_turns=True)
 
             self.logger.info("Reconstructed LAC Image 1 ...")
 
-            image_2 = self.scanner.reconstruct_data(self.data2,
-                                                    full_range=True,
-                                                    append_air_turns=True)
+            image_2 = self.scanner.reconstruct_data(
+                self.data2 * sino_correction,
+                full_range=True, append_air_turns=True)
             self.logger.info("Reconstructed LAC Image 2 ...")
 
             del self.data1, self.data2
         elif self.xray_source_model['num_spectra']==1:
-            image_1 = self.scanner.reconstruct_data(self.data,
-                                                    full_range=True,
-                                                    append_air_turns=True)
+            image_1 = self.scanner.reconstruct_data(
+                self.data * sino_correction,
+                full_range=True, append_air_turns=True)
             self.logger.info("Reconstructed LAC Image ...")
             del self.data
 
@@ -1571,11 +1616,14 @@ class DEBISimPipeline(object):
 
                 if self.scanner.machine_geometry['scanner_name'] in (
                         'default_parallelbeam', 'parallel_custom'):
-                    # Single contiguous copy: moveaxis + flip in one step
+                    # FBP returns (n_slices, im_x, im_y) — reorder to
+                    # (im_x, im_y, n_slices) to match GT volume layout.
+                    # No flip — axis orientation must match GT labels for
+                    # correct HU statistics and DICOM ROI alignment.
                     image_1 = np.ascontiguousarray(
-                        moveaxis(image_1, 0, -1)[::-1, :, :])
+                        moveaxis(image_1, 0, -1))
                     image_2 = np.ascontiguousarray(
-                        moveaxis(image_2, 0, -1)[::-1, :, :])
+                        moveaxis(image_2, 0, -1))
 
                 image_1 *= scale
                 image_1 = (image_1 - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
@@ -1628,7 +1676,7 @@ class DEBISimPipeline(object):
                 if self.scanner.machine_geometry['scanner_name'] in (
                         'default_parallelbeam', 'parallel_custom'):
                     image_1 = np.ascontiguousarray(
-                        moveaxis(image_1, 0, -1)[::-1, :, :])
+                        moveaxis(image_1, 0, -1))
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file']%1)
@@ -1656,35 +1704,44 @@ class DEBISimPipeline(object):
                 if self.scanner.machine_geometry['scanner_name'] in (
                         'default_parallelbeam', 'parallel_custom'):
                     image_c = np.ascontiguousarray(
-                        moveaxis(image_c, 0, -1)[::-1, :, :])
+                        moveaxis(image_c, 0, -1))
                     image_pe = np.ascontiguousarray(
-                        moveaxis(image_pe, 0, -1)[::-1, :, :])
+                        moveaxis(image_pe, 0, -1))
                     image_z = np.ascontiguousarray(
-                        moveaxis(image_z, 0, -1)[::-1, :, :])
+                        moveaxis(image_z, 0, -1))
 
+                # Compton and PE images are basis decomposition outputs —
+                # they are NOT in LAC units, so the HU formula does not
+                # apply.  Scale by img_scale (same as LAC images) to undo
+                # the self.scale used in the energy loop, then store as-is.
+                #
+                # Z_eff is a dimensionless quantity (effective atomic number)
+                # and should never be HU-normalized.
                 image_c *= scale
                 image_pe *= scale
-                image_c = (image_c - mu_w['compton'])/mu_w['compton']*1000 + offset
-                image_pe = (image_pe - mu_w['pe'])/mu_w['pe']*1000 + offset
-                image_z = (image_z - mu_w['z'])/mu_w['z']*1000 + offset
-                # Ensure image_z and image_1/2 have matching shapes before
-                # boolean indexing (they can differ if the decomposer
-                # sinogram shape differs from the LAC sinogram shape).
+                # Mask Z_eff to 0 in air regions (where LAC is near -1000 HU)
+                # so the viewer doesn't display noise as atomic number.
+                air_threshold = cmin + 200  # -800 HU
                 if image_z.shape != image_1.shape:
-                    # Crop or pad to the minimum common shape
                     common = tuple(builtins.min(a, b) for a, b in
                                    zip(image_z.shape, image_1.shape))
                     image_z = image_z[:common[0], :common[1], :common[2]]
                     image_1_crop = image_1[:common[0], :common[1], :common[2]]
                     image_2_crop = image_2[:common[0], :common[1], :common[2]]
-                    image_z[image_1_crop < cmin + 200] = cmin
-                    image_z[image_2_crop < cmin + 200] = cmin
+                    image_z[image_1_crop < air_threshold] = 0
+                    image_z[image_2_crop < air_threshold] = 0
                 else:
-                    image_z[image_1 < cmin+200] = cmin
-                    image_z[image_2 < cmin+200] = cmin
-                image_c  = clip(image_c,  cmin, cmax).astype(STORAGE_DTYPE)
-                image_pe = clip(image_pe, cmin, cmax).astype(STORAGE_DTYPE)
-                image_z  = clip(image_z,  cmin, cmax).astype(STORAGE_DTYPE)
+                    image_z[image_1 < air_threshold] = 0
+                    image_z[image_2 < air_threshold] = 0
+
+                # Basis decomposition outputs have fractional values —
+                # store as float32, not int16 (which truncates 0.54 → 0).
+                # Negative values from unconstrained LM are preserved
+                # (realistic — real scanners produce them from noise).
+                # Z_eff is clamped to [0, 92] since negative Z is undefined.
+                image_z = clip(image_z, 0, 92).astype(np.float32)
+                image_c = image_c.astype(np.float32)
+                image_pe = image_pe.astype(np.float32)
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % img_suffixes[0])
@@ -1768,32 +1825,52 @@ class DEBISimPipeline(object):
 
         # Build scan metadata from scanner and source model
         mg = self.scanner_geometry
+        rp = self.scanner.recon_params
         dosage_list = self.xray_source_model.get('dosage', [])
+        spectra_paths = self.xray_source_model.get('spectra', [])
         scan_metadata = dict(
+            # Scanner identification
             scanner_name=mg.get('scanner_name', 'DEBISim2'),
             geometry=self.scanner.geom,
             scan_type=self.scanner.scan,
+            # Geometry
             source_origin=mg.get('source_origin', ''),
             origin_det=mg.get('origin_det', ''),
+            gantry_diameter=mg.get('gantry_diameter', ''),
+            fov=mg.get('gantry_diameter', ''),
+            # Detector
             det_row_count=mg.get('det_row_count', ''),
             det_col_count=mg.get('det_col_count', ''),
+            det_spacing_x=mg.get('det_spacing_x', ''),
+            det_spacing_y=mg.get('det_spacing_y', ''),
             sens_spacing_x=mg.get('sens_spacing_x', ''),
             sens_spacing_y=mg.get('sens_spacing_y', ''),
-            gantry_diameter=mg.get('gantry_diameter', ''),
             anode_angle=mg.get('anode_angle', ''),
-            num_views=mg.get('num_views', ''),
+            # Acquisition
+            num_views=rp.get('n_views', ''),
+            view_range=rp.get('view_range', ''),
+            num_spectra=self.xray_source_model.get('num_spectra', 1),
             kVp=kvp if kvp is not None else '',
             dosage=dosage_list[0] if len(dosage_list) > 0 else '',
+            dosage_list=dosage_list,
+            spectra_files=[os.path.basename(s) for s in spectra_paths],
+            # Reconstruction
             recon_algo=self.scanner.recon,
-            image_dims=self.scanner.recon_params.get('image_dims', []),
-            fov=mg.get('gantry_diameter', ''),
+            image_dims=rp.get('image_dims', []),
+            img_scale=rp.get('img_scale', ''),
         )
+
+        # Derive pixel spacing from scanner geometry
+        pixel_sz = mg.get('det_spacing_y', 1.0)
+        slice_sz = mg.get('det_spacing_x', pixel_sz)
 
         _save_dicom(
             image_dir=self.f_loc['image_dir'],
             recon_images=recon_images,
             gt_label_volume=gt_label,
             sf_obj_list=self.sf_obj_list,
+            pixel_spacing=(float(pixel_sz), float(pixel_sz)),
+            slice_thickness=float(slice_sz),
             scan_metadata=scan_metadata,
             mu_handler=self.mu,
         )

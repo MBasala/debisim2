@@ -65,6 +65,13 @@ if __name__ == '__main__':
                         type=int
                         )
 
+    parser.add_argument('--compress_dicom',
+                        action='store_true',
+                        default=False,
+                        help='compress DICOM output folder into a .zip archive '
+                             'and remove the uncompressed directory to save disk space'
+                        )
+
     args = parser.parse_args()
 
     spec = config_loader.spec_from_file_location("config.params",
@@ -76,5 +83,6 @@ if __name__ == '__main__':
 
     config.params['num_bags'] = range(1, args.num_bags+1)
     config.params['num_workers'] = args.num_workers
+    config.params['compress_dicom'] = args.compress_dicom
     run_xray_dataset_generator(**config.params)
 # ----------------------------------------------------------------------------

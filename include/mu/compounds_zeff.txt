@@ -1,0 +1,15 @@
+air	7.6277
+acetal	6.9598
+neoprene	12.4472
+polyethylene	5.4542
+polystyrene	5.7010
+pyrex	11.0502
+water	7.4278
+salt	15.1913
+bone	15.9011
+acrylic	6.4780
+teflon	8.4378
+pvc	13.9095
+polyester	6.6458
+nylon6	6.1304
+bakelite	6.3964

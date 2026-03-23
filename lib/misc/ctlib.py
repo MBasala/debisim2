@@ -121,7 +121,10 @@ def photoelectric(e):
     :return: PE basis value
     ----------------------------------------------------------------------------
     """
-    return (e * 1.0) ** -3
+    # Normalized: PE(e) / PE(60) = (60/e)^3
+    # Makes PE(60) = 1.0, comparable to KN(60) ~ 1.09 for balanced
+    # Jacobian columns in the LM optimizer.
+    return (60.0 / e) ** 3
 
 # ------------------------------------------------------------------------------
 
@@ -161,8 +164,14 @@ def effective_atomic_number(img_p, img_c):
     :return img_z   - Z_eff image
     ---------------------------------------------------------------------"""
 
-    Kp = 1 / 2.585
+    # Alvarez-Macovski Z_eff from Compton/PE basis decomposition.
+    # The PE basis is normalized to PE(E_ref)=1.0 where E_ref=60 keV,
+    # so the fitted PE parameter is smaller by E_ref^3 compared to the
+    # raw e^(-3) basis.  Kp absorbs this normalization:
+    #   Kp = (1/2.501) * E_ref^(3/n)
+    E_ref = 60.0
     n = 3.5
+    Kp = (1.0 / 2.501) * E_ref ** (3.0 / n)
 
     if  isscalar(img_p) and  isscalar(img_c):
         return Kp * (img_p / img_c) ** (1 / n)

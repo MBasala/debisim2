@@ -204,7 +204,7 @@ decomp_method = 'none' # constrained decomposition method for DECT
 cdm_args = dict(cdm_solver='gpu',
                 cdm_type='cpd',     # Compton-PE basis - default
                 projector='cpu',
-                init_val=(0, 0))
+                init_val=(0.1, 0.1))
 
 fwd_mdl_args = dict(
             add_poisson_noise=True,

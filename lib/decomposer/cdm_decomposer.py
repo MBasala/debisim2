@@ -175,7 +175,15 @@ class CDMDecomposer(DEDecomposer):
         # Compute the energy dependent coefficients
         self.pix_no = 0
         t = time.time()
-        scc, scp = 1e0, 1e0
+
+        # Basis function scaling for the optimizer.
+        #
+        # The PE basis is now normalized: PE(e) = (60/e)^3, giving
+        # PE(60) = 1.0 — comparable to KN(60) ≈ 1.09.  This makes the
+        # Jacobian columns balanced and the optimizer can distinguish
+        # Compton from PE contributions.  With normalized bases, both
+        # scc and scp can be 1.0.
+        scc, scp = 1.0, 1.0
 
         # Decompose every energy pair in the sinograms
         def _decomp(p_h, p_l):
@@ -329,7 +337,22 @@ class CDMDecomposer(DEDecomposer):
             print("CDM+CPD is using GPU...")
             t0 = time.time()
             GFtol = 1e-4
-            GFmaxIter = 20
+            GFmaxIter = 100
+
+            # Auto-estimate initial values from sinogram statistics.
+            # With normalized PE basis (PE(60)=1.0) and KN(60)≈1.09,
+            # both parameters are on the same scale as the sinogram values.
+            # Sinograms should be in cm⁻¹ (after decomp_scale in pipeline).
+            pos_h = sino_h[sino_h > 0.01]
+            pos_l = sino_l[sino_l > 0.01]
+            mean_sino = ((np.mean(pos_h) if pos_h.size else 0.5) +
+                         (np.mean(pos_l) if pos_l.size else 0.5)) / 2
+            # Compton dominates at diagnostic energies (~80% of LAC)
+            auto_c = np.float32(np.maximum(mean_sino * 0.8, 0.05))
+            auto_p = np.float32(np.maximum(mean_sino * 0.2, 0.01))
+            self.init_val = array([auto_p, auto_c])
+            print(f"  Auto init_val: PE={auto_p:.4f}, Compton={auto_c:.4f}, "
+                  f"mean_sino={mean_sino:.3f}")
             # User info
             GFui = concatenate((
                 [scc, scp],
@@ -375,6 +398,8 @@ class CDMDecomposer(DEDecomposer):
 
             GF_out = np.array(GFres[0], copy=True)
 
+            # With scc=scp=1.0 and normalized PE basis, output is directly
+            # in physical basis coefficient units.
             sino_c = GF_out[:, 0].flatten().reshape(self.sino_shape)
             sino_p = GF_out[:, 1].flatten().reshape(self.sino_shape)
             t1 = time.time()
