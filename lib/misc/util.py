@@ -24,6 +24,99 @@ from PIL import Image
 import imageio
 
 
+class DicomCoordinateMapper:
+    """Centralizes coordinate transforms between DEBISim internal volumes
+    and DICOM pixel/patient coordinate space.
+
+    DEBISim stores volumes as [X, Y, Z].
+    DICOM stores pixel arrays as [row, col] with orientation defined by
+    ImageOrientationPatient (IOP).
+
+    With IOP [1,0,0, 0,1,0]:
+      - Row direction = patient +X
+      - Column direction = patient +Y
+      - The viewer affine maps: col → patient X, row → patient Y
+      - Therefore pixel_array[row, col] = data[Y_idx, X_idx]
+      - A .T transpose converts [X, Y] → [Y, X] for storage
+
+    This class owns all three operations:
+      1. volume_slice_to_pixels() — for DICOM CT series writing
+      2. voxel_to_patient()       — for RT-Struct contour generation
+      3. patient_to_voxel()       — for RT-Struct contour rasterization
+
+    All transforms are derived from the same IOP and pixel_spacing,
+    so they stay consistent automatically.
+    """
+
+    # Standard axial orientation: row=+X, col=+Y
+    IOP = [1, 0, 0, 0, 1, 0]
+
+    def __init__(self, pixel_spacing=(1.0, 1.0), slice_thickness=1.0,
+                 origin=(0.0, 0.0, 0.0)):
+        self.pixel_spacing = tuple(float(p) for p in pixel_spacing)
+        self.slice_thickness = float(slice_thickness)
+        self.origin = tuple(float(o) for o in origin)
+        # Row spacing = ps[0], Col spacing = ps[1]
+        # With IOP [1,0,0,0,1,0]: col→X uses ps[1], row→Y uses ps[0]
+        # but pydicom PixelSpacing is [row_spacing, col_spacing]
+        self._ps_row = self.pixel_spacing[0]
+        self._ps_col = self.pixel_spacing[1]
+
+    def volume_slice_to_pixels(self, vol_slice_xy):
+        """Convert a [X, Y] volume slice to DICOM pixel array [row=Y, col=X].
+
+        Parameters
+        ----------
+        vol_slice_xy : ndarray, shape (nx, ny)
+            A 2D slice from the internal volume (X along axis 0, Y along axis 1).
+
+        Returns
+        -------
+        pixel_data : ndarray, shape (ny, nx)
+            Transposed and clipped to int16 for DICOM storage.
+        """
+        return np.clip(vol_slice_xy.T, -32768, 32767).astype(np.int16)
+
+    def pixel_rows_cols(self, vol_slice_xy):
+        """Return (Rows, Columns) for the DICOM header after transpose."""
+        return vol_slice_xy.shape[1], vol_slice_xy.shape[0]  # (ny, nx)
+
+    def voxel_to_patient(self, row_idx, col_idx, z_idx):
+        """Convert GT volume indices (X=row_idx, Y=col_idx, Z=z_idx)
+        to DICOM patient coordinates (x_mm, y_mm, z_mm).
+
+        The GT volume is indexed as [X, Y, Z].  find_contours on
+        gt[:, :, z] returns (row, col) = (X_idx, Y_idx).
+
+        With IOP [1,0,0, 0,1,0], the viewer affine maps:
+          patient X = origin_x + col_idx * ps_col   (col tracks X)
+          patient Y = origin_y + row_idx * ps_row   (row tracks Y)
+
+        But our contour (row, col) from find_contours on [X, Y] gives
+        row=X_idx, col=Y_idx.  So:
+          patient X = X_idx * ps_row   (from the first axis)
+          patient Y = Y_idx * ps_col   (from the second axis)
+        """
+        x_mm = float(row_idx) * self._ps_row + self.origin[0]
+        y_mm = float(col_idx) * self._ps_col + self.origin[1]
+        z_mm = float(z_idx) * self.slice_thickness + self.origin[2]
+        return x_mm, y_mm, z_mm
+
+    def image_position_patient(self, z_idx):
+        """Return ImagePositionPatient for a given slice index."""
+        return [self.origin[0], self.origin[1],
+                self.origin[2] + z_idx * self.slice_thickness]
+
+    def dicom_tags(self):
+        """Return a dict of orientation-related DICOM tags."""
+        return dict(
+            ImageOrientationPatient=list(self.IOP),
+            PixelSpacing=list(self.pixel_spacing),
+            SliceThickness=str(self.slice_thickness),
+            SpacingBetweenSlices=str(self.slice_thickness),
+        )
+
+
 class Logger(object):
     """
     ---------------------------------------------------------------------------
@@ -604,10 +697,14 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         ds.WindowWidth = '400'
 
         # --- Image Pixel Module ---
-        ds.ImagePositionPatient = [0.0, 0.0, float(z * slice_thickness)]
-        ds.ImageOrientationPatient = [1, 0, 0, 0, 1, 0]
-        ds.PixelSpacing = list(pixel_spacing)
-        ds.SliceThickness = str(slice_thickness)
+        # All coordinate transforms are handled by DicomCoordinateMapper
+        # to keep pixel data, IOP, and contour generation consistent.
+        coord = DicomCoordinateMapper(pixel_spacing, slice_thickness)
+        dicom_tags = coord.dicom_tags()
+        ds.ImagePositionPatient = coord.image_position_patient(z)
+        ds.ImageOrientationPatient = dicom_tags['ImageOrientationPatient']
+        ds.PixelSpacing = dicom_tags['PixelSpacing']
+        ds.SliceThickness = dicom_tags['SliceThickness']
         ds.SliceLocation = str(z * slice_thickness)
 
         ds.SamplesPerPixel = 1
@@ -620,14 +717,11 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         ds.RescaleSlope = '1'
         ds.RescaleType = 'HU'
 
-        # Standard DICOM convention: pixel_array[row, col] where row=Y, col=X.
-        # IOP [1,0,0, 0,1,0] means row direction = +X (patient), col direction = +Y.
-        # The viewer builds the affine as: col→patient X, row→patient Y.
-        # So pixel_array[row=Y_idx, col=X_idx] — transpose the [X,Y] slice.
-        slice_data = volume_3d[:, :, z].T
-        ds.Rows = slice_data.shape[0]
-        ds.Columns = slice_data.shape[1]
-        pixel_data = np.clip(slice_data, -32768, 32767).astype(np.int16)
+        vol_slice = volume_3d[:, :, z]
+        rows, cols = coord.pixel_rows_cols(vol_slice)
+        ds.Rows = rows
+        ds.Columns = cols
+        pixel_data = coord.volume_slice_to_pixels(vol_slice)
         ds.PixelData = pixel_data.tobytes()
 
         # --- File Meta ---
@@ -762,16 +856,14 @@ def create_rtstruct(output_path, roi_list, gt_label_volume,
             if mask_slice.sum() == 0:
                 continue
             contours = find_contours(mask_slice, 0.5)
+            coord = DicomCoordinateMapper(pixel_spacing, slice_thickness)
             for contour in contours:
-                # Convert pixel coords (row, col) to patient coords (x, y, z)
+                # Convert GT voxel indices to patient coords via the
+                # shared DicomCoordinateMapper (same transform used
+                # by save_dicom_series for pixel data).
                 contour_data = []
                 for row, col in contour:
-                    # ImageOrientationPatient = [1,0,0, 0,1,0] means:
-                    #   row direction = +X, column direction = +Y
-                    # numpy array[row, col] → patient (X=row*ps, Y=col*ps)
-                    x = row * pixel_spacing[0]
-                    y = col * pixel_spacing[1]
-                    z_pos = z * slice_thickness
+                    x, y, z_pos = coord.voxel_to_patient(row, col, z)
                     contour_data.extend([x, y, z_pos])
 
                 c_item = Dataset()
