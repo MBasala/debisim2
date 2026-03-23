@@ -39,10 +39,9 @@ class DicomCoordinateMapper:
       - Therefore pixel_array[row, col] = data[Y_idx, X_idx]
       - A .T transpose converts [X, Y] → [Y, X] for storage
 
-    This class owns all three operations:
+    This class owns these operations:
       1. volume_slice_to_pixels() — for DICOM CT series writing
       2. voxel_to_patient()       — for RT-Struct contour generation
-      3. patient_to_voxel()       — for RT-Struct contour rasterization
 
     All transforms are derived from the same IOP and pixel_spacing,
     so they stay consistent automatically.

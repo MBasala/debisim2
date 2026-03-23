@@ -165,7 +165,7 @@ class TestBeerLambertTransform:
         assert trans_high.mean() < trans_low.mean()
 
     def test_log_attenuation_roundtrip(self):
-        """log(-exp(-x)) should return x (within numerical precision)."""
+        """-log(exp(-x)) should return x (within numerical precision)."""
         rng = np.random.default_rng(42)
         proj = rng.uniform(0.01, 5.0, size=(4, 10, 8)).astype(np.float32)
         transmitted = np.exp(-proj)
@@ -266,9 +266,9 @@ class TestRamLakFilter:
 
     def test_ramlak_dc_component(self, small_scanner):
         """DC component of frequency-domain ramp filter |ω| is 0 at index 0.
-        Our implementation uses spatial-domain kernel: k[0]=0.25,
-        k[odd]=-1/(πk)², so FFT[0] = sum of kernel ≈ 0.25 + negative terms.
-        The exact DC depends on N; just verify it's finite and real."""
+        The current implementation generates the ramp directly in the
+        frequency domain: [0, 1/half, 2/half, ..., 1, ..., 2/half, 1/half].
+        DC (index 0) should be exactly 0. Verify it's finite and real."""
         ramlak_col = small_scanner.ramlak[:, 0]
         dc = ramlak_col[0]
         assert np.isfinite(dc.real), f"DC component should be finite, got {dc}"

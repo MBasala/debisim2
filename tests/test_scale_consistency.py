@@ -1,13 +1,14 @@
 """
 Unit tests for scale factor consistency across scanner configurations.
 
-Verifies that self.scale × img_scale = 1.0 and that the full pipeline
-produces correct HU values regardless of pixel_size_mm, det_spacing_y,
-or scanner geometry.
+Verifies that the full projection → reconstruction → HU chain produces
+correct LAC values regardless of pixel_size_mm or scanner geometry.
 
-The invariant under test:
-    mu_curve = mu(cm²/g) × density(g/cm³) × self.scale
-    recon_lac = FBP(sinogram(mu_curve)) × img_scale
+The correction chain under test:
+    mu_curve = mu(cm²/g) × density(g/cm³) × self.scale    (self.scale = 0.1)
+    sinogram = forward_project(mu_curve)                    (in mm⁻¹ units)
+    sino_corrected = sinogram × (1 / self.scale)            (back to cm⁻¹)
+    recon_lac = FBP(sino_corrected)                         (cm⁻¹)
     HU = (recon_lac - mu_w) / mu_w × 1000
 
     For water: HU must equal 0 (±tolerance) at ANY pixel size.

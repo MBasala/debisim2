@@ -1129,8 +1129,8 @@ class BaggageImage3D(object):
         # Grid layout centred in the working volume.
         # The final image is cropped from ws_bag to img_vol dimensions, so
         # blocks must fit within the cropped region, not the full ws_bag.
-        crop_x = self.img_vol[0] // 2 if self.img_vol[0] < self.size else self.size
-        crop_y = self.img_vol[1] // 2 if self.img_vol[1] < self.size else self.size
+        crop_x = self.img_vol[0] if self.img_vol[0] < self.size else self.size
+        crop_y = self.img_vol[1] if self.img_vol[1] < self.size else self.size
 
         # Auto-shrink block_size and gap if the grid doesn't fit.
         total_x = rows * block_size + (rows - 1) * gap
