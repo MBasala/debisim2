@@ -55,8 +55,8 @@ mlist = [
 material_pdf = [1.0 / len(mlist)] * len(mlist)
 
 # Liquids that may appear in containers
-lqd_list = ['water', 'ethanol', 'saline035', 'H2O2']
-liquid_pdf = [0.4, 0.3, 0.2, 0.1]
+lqd_list = ['water']
+liquid_pdf = [1.0]
 
 # ---- STL object pools --------------------------------------------------------
 stl_pool_config = dict(
@@ -70,42 +70,42 @@ stl_pool_config = dict(
         # === TUNE THESE PROBABILITIES FOR YOUR DEMO ===
         firearms=dict(
             pool=discover_pool(STL_FIREARMS_DIR),
-            spawn_prob=0.8,             # 80% chance per bag
-            count_range=(1, 2),         # 1-2 firearms when spawned
-            materials=['Fe', 'Al', 'Ti'],
-            material_pdf=[0.5, 0.3, 0.2],
+            spawn_prob=1,
+            count_range=(1, 2),
+            materials=['4150crmov', 'Ti'],
+            material_pdf=[0.8, 0.2],
         ),
         sharp_objects=dict(
             pool=discover_pool(STL_SHARP_DIR),
-            spawn_prob=0.4,             # 40% chance
-            count_range=(1, 3),         # 1-3 sharp objects
-            materials=['Fe', 'Ti', 'Al'],
-            material_pdf=[0.5, 0.3, 0.2],
+            spawn_prob=1,
+            count_range=(1, 1),
+            materials=['8cr13mov', 'Ti'],
+            material_pdf=[0.8, 0.2],
         ),
         explosives=dict(
             pool=discover_pool(STL_EXPLOSIVES_DIR),
-            spawn_prob=0.3,             # 30% chance
-            count_range=(1, 2),
-            materials=['ethanol', 'acetal', 'acrylic', 'neoprene'],
-            material_pdf=[0.3, 0.3, 0.2, 0.2],
+            spawn_prob=1,
+            count_range=(1, 1),
+            materials=['rdx'],
+            material_pdf=[1.0],
         ),
         other=dict(
             pool=discover_pool(STL_OTHER_THREATS_DIR),
-            spawn_prob=0.2,             # 20% chance
-            count_range=(1, 2),
+            spawn_prob=0.0,
+            count_range=(0, 0),
             materials=['acetal', 'bakelite', 'pvc'],
             material_pdf=[0.4, 0.3, 0.3],
         ),
     ),
     fillers=dict(
         pool=discover_pool(STL_FILLERS_DIR),
-        count_range=(5, 15),            # 5-15 random filler objects
+        count_range=(3, 5),            # 5-15 random filler objects
         materials=mlist,
         material_pdf=material_pdf,
     ),
     liquid_containers=dict(
         pool=discover_pool(STL_LIQUID_CONTAINERS_DIR),
-        count_range=(0, 3),             # 0-3 liquid containers
+        count_range=(0, 2),
         container_materials=['pyrex', 'polyethylene', 'acrylic'],
         container_material_pdf=[0.4, 0.3, 0.3],
         liquid_materials=lqd_list,

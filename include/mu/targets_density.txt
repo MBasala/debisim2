@@ -12,3 +12,6 @@ saline090	1.104
 saline110	1.128
 saline120	1.139
 saline140	1.162
+rdx	1.820
+8cr13mov	7.750
+4150crmov	7.850
