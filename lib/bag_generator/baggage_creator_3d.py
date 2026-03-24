@@ -1943,15 +1943,34 @@ class BaggageImage3D(object):
             self.ws_bag[nz] =self.prior_image[nz]
 
         self.ws_bag[self.ws_bag<0] = 0
-        self.virtual_bag[
-        self.img_ctr[0]-self.bb_h:self.img_ctr[0]+self.bb_h,
-        self.img_ctr[1]-self.bb_h:self.img_ctr[1]+self.bb_h,
-        self.img_ctr[2]-self.bb_h:self.img_ctr[2]+self.bb_h
-        ] = self.ws_bag[
-        self.size//2-self.bb_h:self.size//2+self.bb_h,
-        self.size//2-self.bb_h:self.size//2+self.bb_h,
-        self.size//2-self.bb_h:self.size//2+self.bb_h
-        ]
+
+        # Clip the copy region to the virtual_bag's actual extents.
+        # ws_bag is always cubic (size³), but virtual_bag may have a shorter
+        # Z-axis when n_slices < image_dims[0].
+        vb = self.virtual_bag
+        bb = self.bb_h
+        ctr_v = self.img_ctr
+        ctr_w = self.size // 2
+
+        x0_v, x1_v = ctr_v[0] - bb, ctr_v[0] + bb
+        y0_v, y1_v = ctr_v[1] - bb, ctr_v[1] + bb
+        z0_v, z1_v = ctr_v[2] - bb, ctr_v[2] + bb
+
+        # Clamp destination to virtual_bag shape
+        x0_v, x1_v = builtins.max(x0_v, 0), builtins.min(x1_v, vb.shape[0])
+        y0_v, y1_v = builtins.max(y0_v, 0), builtins.min(y1_v, vb.shape[1])
+        z0_v, z1_v = builtins.max(z0_v, 0), builtins.min(z1_v, vb.shape[2])
+
+        # Matching source region in ws_bag
+        x0_w = ctr_w - bb + (x0_v - (ctr_v[0] - bb))
+        y0_w = ctr_w - bb + (y0_v - (ctr_v[1] - bb))
+        z0_w = ctr_w - bb + (z0_v - (ctr_v[2] - bb))
+        x1_w = x0_w + (x1_v - x0_v)
+        y1_w = y0_w + (y1_v - y0_v)
+        z1_w = z0_w + (z1_v - z0_v)
+
+        vb[x0_v:x1_v, y0_v:y1_v, z0_v:z1_v] = \
+            self.ws_bag[x0_w:x1_w, y0_w:y1_w, z0_w:z1_w]
 
         self.virtual_bag = self.virtual_bag*self.gantry_cavity[:,:,newaxis]
 
