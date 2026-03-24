@@ -60,6 +60,11 @@ MANIFEST
 *.manifest
 *.spec
 
+#AI directories
+.claude
+.codex
+.code-workspace
+
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
@@ -157,6 +162,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+*.whl
 
 # Spyder project settings
 .spyderproject
@@ -184,4 +190,12 @@ cython_debug/
 
 #  JetBrains specific
 .idea/
+#VS Code
+.vscode/
 
+#3D files
+/examples/stl_pools/*/*
+/examples/custom_shapes/*
+#Program generated files
+/benchmarks/results/*
+/results/*

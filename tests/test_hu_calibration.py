@@ -101,13 +101,14 @@ class TestHUCalibration:
         assert abs(computed['lac_1'] - hardcoded['lac_1']) > 0.01, \
             "Hardcoded lac_1 unexpectedly matches computed — test premise invalid"
 
-    def test_img_scale_consistent_with_det_spacing(self):
-        """img_scale should equal 1/det_spacing_y for any pixel_size_mm."""
+    def test_img_scale_is_unity(self):
+        """img_scale should be 1.0 for all pixel sizes.
+        Unit correction is now handled via sino_correction (1/self.scale)
+        applied to the sinogram before reconstruction."""
         from lib.forward_model.scanner_template import create_parallel_scanner
         for px in [0.5, 1.0, 2.0]:
             scanner = create_parallel_scanner(
                 gantry_diameter_mm=512, pixel_size_mm=px, n_slices=100)
-            expected_scale = 1.0 / scanner.machine_geometry['det_spacing_y']
             actual_scale = scanner.recon_params['img_scale']
-            assert abs(actual_scale - expected_scale) < 1e-10, \
-                f"img_scale={actual_scale} != 1/det_spacing_y={expected_scale}"
+            assert abs(actual_scale - 1.0) < 1e-10, \
+                f"img_scale={actual_scale} != 1.0 for pixel_size_mm={px}"

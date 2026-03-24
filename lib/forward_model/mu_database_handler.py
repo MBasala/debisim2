@@ -228,6 +228,9 @@ _COMPOUND_FORMULAS = {
     'bakelite':     'C7H8O2',
     'ethanol':      'C2H6O',
     'H2O2':         'H2O2',
+    'rdx':          'C3H6N6O6',
+    '8cr13mov':     'Fe0.8505Cr0.13C0.008Mo0.0015V0.001Mn0.004Si0.005',
+    '4150crmov':    'Fe0.9715Cr0.0095Mo0.002V0.0008C0.005Mn0.0087Si0.0025',
 }
 # Saline solutions: H2O + NaCl at varying concentrations
 for _pct in ['035','050','060','070','080','090','100','110','120','130','140','150']:
