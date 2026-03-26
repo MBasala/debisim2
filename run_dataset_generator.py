@@ -83,6 +83,8 @@ if __name__ == '__main__':
 
     config.params['num_bags'] = range(1, args.num_bags+1)
     config.params['num_workers'] = args.num_workers
-    config.params['compress_dicom'] = args.compress_dicom
+    # CLI --compress_dicom overrides config only when explicitly passed
+    if args.compress_dicom:
+        config.params['compress_dicom'] = True
     run_xray_dataset_generator(**config.params)
 # ----------------------------------------------------------------------------
