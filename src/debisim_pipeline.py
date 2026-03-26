@@ -29,7 +29,6 @@ import scipy.ndimage as sptx
 import torch
 import torch.nn as nn
 import astra
-import matplotlib.pyplot as plt
 from numpy import (array, zeros, zeros_like, ones, arange, loadtxt,
                    log, exp, clip, unique, moveaxis, newaxis, float32, int16,
                    isscalar, copy, save, savez_compressed)
@@ -37,7 +36,6 @@ from tqdm import tqdm
 from torch.distributions import Poisson, Normal
 from skimage.measure import regionprops
 from tabulate import tabulate
-from matplotlib import rcParams
 
 # ---------------------------------------------------------------------------
 # Pipeline dtype templates
@@ -72,7 +70,6 @@ from lib.decomposer.cdm_decomposer import CDMDecomposer
 from lib.misc.util import (save_fits_data, save_fits_data_async, flush_async_io,
                             read_fits_data, create_gif, get_logger)
 
-rcParams.update({'figure.autolayout': True})
 if torch.cuda.is_available():
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
@@ -1662,14 +1659,6 @@ class DEBISimPipeline(object):
                            np.clip(image_2+1000, 0, 3500), stride=2)
                 self.logger.info("Created GIFs for simulated volumes")
 
-                if plot_stats:
-                    gt_np = self.gt_image_3d.cpu().numpy() if torch.is_tensor(
-                        self.gt_image_3d) else self.gt_image_3d
-                    self.plot_baggage_statistics(
-                        gt_img=gt_np,
-                        recon_images=[image_1, image_2])
-                    self.logger.info("Plotted Baggage Statistics")
-
             elif self.xray_source_model['num_spectra'] == 1:
                 image_1 *= scale
                 image_1 = (image_1 - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
@@ -1693,14 +1682,6 @@ class DEBISimPipeline(object):
                            np.clip(image_1+1000, 0, 3500), stride=2)
 
                 self.logger.info("Created GIFs for simulated volumes")
-
-                if plot_stats:
-                    gt_np = self.gt_image_3d.cpu().numpy() if torch.is_tensor(
-                        self.gt_image_3d) else self.gt_image_3d
-                    self.plot_baggage_statistics(
-                        gt_img=gt_np,
-                        recon_images=[image_1])
-                    self.logger.info("Plotted Baggage Statistics")
 
             if self.DECOMPOSER_FLAG:
                 if self.scanner.machine_geometry['scanner_name'] in (
@@ -2023,202 +2004,6 @@ class DEBISimPipeline(object):
         torch.cuda.empty_cache()   # single cleanup after all GT images saved
     # --------------------------------------------------------------------------
 
-    def plot_baggage_statistics(self, gt_img=None, recon_images=None):
-        """
-        ------------------------------------------------------------------------
-        Plot per-material HU statistics from the reconstructed images.
-
-        :param gt_img:        ground-truth label volume (numpy).  If None,
-                              falls back to reading from disk (legacy path).
-        :param recon_images:  list of reconstructed HU volumes (numpy).
-                              Length must match num_spectra.  If None,
-                              falls back to reading from disk.
-        :return:
-        ------------------------------------------------------------------------
-        """
-
-        spec_num = self.xray_source_model['num_spectra']
-        lqd_labels = [x['lqd_param']['lqd_label']
-                      for x in self.sf_obj_list if x['lqd_flag']]
-
-        lbl_materials = {
-            **{x['label']: x['material'] for x in self.sf_obj_list},
-            **{x['lqd_param']['lqd_label']: x['lqd_param']['lqd_material']
-               for x in self.sf_obj_list if x['lqd_flag']}
-        }
-
-        max_label = builtins.max(list(lbl_materials.keys()))
-
-        # --- Resolve inputs: prefer in-memory, fall back to disk -------------
-        if gt_img is None:
-            flush_async_io()
-            gt_img = read_fits_data(os.path.join(self.f_loc['gt_image']), 0)
-
-        # GT label image must be integer for regionprops — FITS stores as float
-        gt_img = np.asarray(gt_img)
-        if not np.issubdtype(gt_img.dtype, np.integer):
-            gt_img = gt_img.astype(NP_INT)
-
-        if spec_num==1:
-
-            if recon_images is not None:
-                recon_img = recon_images[0]
-            else:
-                flush_async_io()
-                recon_img = read_fits_data(os.path.join(self.f_loc['image_dir'],
-                                                        self.f_loc['img_file']%1), 0)
-
-            r_shape, g_shape = recon_img.shape, gt_img.shape
-
-            if r_shape != g_shape:
-                r_buffer = np.ones_like(gt_img)*(-1000)
-
-                init_pt = [g//2-r//2 for g, r in zip(g_shape, r_shape)]
-
-                r_buffer[init_pt[0]:init_pt[0]+r_shape[0],
-                         init_pt[1]:init_pt[1]+r_shape[1],
-                         init_pt[2]:init_pt[2]+r_shape[2]] = recon_img.copy()
-                recon_img = r_buffer.copy()
-
-            rprops = regionprops(gt_img, recon_img)
-            rprop_dict = {r['label']: r for r in rprops}
-
-            headers = ['Label', 'Material',
-                       'Mean',
-                       'Min-Max', 'Vol', 'Bbox', 'Is Liquid']
-
-            r_labels = [r['label'] for r in rprops]
-            r_labels.sort()
-
-            print_table = []
-
-            for i in r_labels:
-                print_table.append(
-                    [i,
-                     lbl_materials[i],
-                     f"{rprop_dict[i]['mean_intensity']}",
-                     f"({rprop_dict[i]['min_intensity']}, "
-                     f"{rprop_dict[i]['max_intensity']})",
-                     f"{rprop_dict[i]['area']}",
-                     f"{rprop_dict[i]['bbox']}",
-                     i in lqd_labels
-                     ]
-                )
-
-            self.logger.info("\n" + tabulate(print_table,
-                                             headers=headers,
-                                             tablefmt='grid'))
-
-            plt.figure()
-            vectors = [recon_img[gt_img==i] for i in r_labels]
-            plt.boxplot(vectors, showfliers=False)
-            plt.xticks(r_labels,
-                       [f"{k}, {lbl_materials[k]}"
-                        for k in r_labels],
-                        rotation='vertical')
-            plt.xlabel("Material Labels")
-            plt.ylabel("Hounsfield Units (HU)")
-            plt.title("Baggage Statistics")
-            plt.savefig(os.path.join(self.f_loc['simulation_dir'],
-                                     'baggage_stats.png'))
-            plt.tight_layout()
-            plt.close()
-
-        if spec_num==2:
-
-            if recon_images is not None:
-                recon_img_1, recon_img_2 = recon_images[0], recon_images[1]
-            else:
-                flush_async_io()
-                recon_img_1 = read_fits_data(os.path.join(self.f_loc['image_dir'],
-                                                          self.f_loc['img_file']%1), 0)
-                recon_img_2 = read_fits_data(os.path.join(self.f_loc['image_dir'],
-                                                          self.f_loc['img_file']%2), 0)
-
-            r_shape, g_shape = recon_img_1.shape, gt_img.shape
-
-            if r_shape != g_shape:
-                # Use the larger of the two shapes as the target buffer
-                buf_shape = tuple(builtins.max(r, g) for r, g in zip(r_shape, g_shape))
-
-                def _embed(src, target_shape):
-                    buf = np.ones(target_shape, dtype=src.dtype) * (-1000)
-                    offset = [(t - s) // 2 for t, s in
-                              zip(target_shape, src.shape)]
-                    buf[offset[0]:offset[0]+src.shape[0],
-                        offset[1]:offset[1]+src.shape[1],
-                        offset[2]:offset[2]+src.shape[2]] = src
-                    return buf
-
-                recon_img_1 = _embed(recon_img_1, buf_shape)
-                recon_img_2 = _embed(recon_img_2, buf_shape)
-                gt_img = _embed(gt_img, buf_shape)
-
-
-            rprops1 = regionprops(gt_img, recon_img_1)
-            rprops2 = regionprops(gt_img, recon_img_2)
-
-            rprop1_dict = {r['label']: r for r in rprops1}
-            rprop2_dict = {r['label']: r for r in rprops2}
-
-            headers = ['Label', 'Material',
-                       'Mean',
-                       'Min-Max', 'Vol', 'Bbox', 'Is Liquid']
-
-            r_labels = [r['label'] for r in rprops1]
-            r_labels.sort()
-
-            print_table = []
-
-            lqd_labels = [x['lqd_param']['lqd_label']
-                          for x in self.sf_obj_list if x['lqd_flag']]
-
-            for i in r_labels:
-                print_table.append(
-                    [i,
-                     lbl_materials[i],
-                     f"{rprop1_dict[i]['mean_intensity']}, "
-                     f"{rprop2_dict[i]['mean_intensity']}",
-                     f"({rprop1_dict[i]['min_intensity']},{rprop1_dict[i]['max_intensity']}),"
-                     f"({rprop2_dict[i]['min_intensity']},{rprop2_dict[i]['max_intensity']})",
-                     f"{rprop1_dict[i]['area']}",
-                     f"{rprop1_dict[i]['bbox']}",
-                     i in lqd_labels
-                     ]
-                )
-
-            self.logger.info("\n" + tabulate(print_table,
-                                             headers=headers,
-                                             tablefmt='grid'))
-
-            plt.figure()
-            vectors = [recon_img_1[gt_img==i] for i in r_labels]
-            plt.boxplot(vectors, showfliers=False)
-            plt.xticks(r_labels,
-                       [f"{k}, {lbl_materials[k]}"
-                        for k in r_labels],
-                       rotation='vertical')
-            plt.xlabel("Material Labels")
-            plt.ylabel("Hounsfield Units (HU)")
-            plt.title("Baggage Statistics (S1)")
-            plt.savefig(os.path.join(self.f_loc['simulation_dir'],
-                                     'baggage_stats_1.png'))
-            plt.close()
-
-            plt.figure()
-            vectors = [recon_img_2[gt_img==i] for i in range(1, max_label+1)]
-            plt.boxplot(vectors, showfliers=False)
-            plt.xticks(r_labels,
-                       [f"{k}, {lbl_materials[k]}"
-                        for k in r_labels],
-                       rotation='vertical')
-            plt.xlabel("Material Labels")
-            plt.ylabel("Hounsfield Units (HU)")
-            plt.title("Baggage Statistics (S2)")
-            plt.savefig(os.path.join(self.f_loc['simulation_dir'],
-                                     'baggage_stats_2.png'))
-            plt.close()
-    # --------------------------------------------------------------------------
 
 
 # ==============================================================================

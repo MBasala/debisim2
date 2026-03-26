@@ -273,8 +273,5 @@ class TestPipelineMethodsExist:
     def test_has_save_dicom_output(self):
         assert callable(getattr(self.pipeline, 'save_dicom_output', None))
 
-    def test_has_plot_baggage_statistics(self):
-        assert callable(getattr(self.pipeline, 'plot_baggage_statistics', None))
-
     def test_has_generate_polychromatic_ct_projection(self):
         assert callable(getattr(self.pipeline, 'generate_polychromatic_ct_projection', None))

@@ -16,7 +16,6 @@ dependencies = [
     "trimesh",
     "scipy-stubs>=1.17",
     "tqdm",
-    "matplotlib",
     "pydicom",
     "astropy",
     "psutil",
