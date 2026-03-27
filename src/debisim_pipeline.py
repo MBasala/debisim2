@@ -331,6 +331,11 @@ class DEBISimPipeline(object):
         #
         self.scale = 0.1  # always cm→mm for noise model compatibility
 
+        # Beam hardening / metal artifact correction flags.
+        # Set via config or overridden before run_reconstructor().
+        self.apply_bhc = True   # water-based BHC (sinogram domain)
+        self.apply_mar = False  # NMAR metal artifact reduction
+
         print_table = []
 
         print_table.append(['Initialization Time',
@@ -1527,23 +1532,52 @@ class DEBISimPipeline(object):
         # produces correct LAC for HU conversion.
         sino_correction = 1.0 / self.scale if abs(self.scale - 1.0) > 1e-6 else 1.0
 
+        # ---- Beam Hardening Correction (sinogram domain) --------------------
+        bhc_correctors = []
+        if getattr(self, 'apply_bhc', True):
+            try:
+                from lib.forward_model.bhc import BeamHardeningCorrector
+                for spec_path in self.xray_source_model['spectra']:
+                    bhc = BeamHardeningCorrector.from_debisim(
+                        self.mu, spec_path, max_kev=self.maxkV)
+                    bhc_correctors.append(bhc)
+                    self.logger.info(
+                        f"BHC LUT built: E_eff={bhc.e_eff:.1f} keV, "
+                        f"mu_mono={bhc.mu_mono:.4f} cm⁻¹")
+            except Exception as e:
+                self.logger.warning(f"BHC initialization failed: {e}")
+                bhc_correctors = []
+
+        def _apply_bhc(sino, spectrum_idx):
+            """Apply BHC to sinogram if corrector is available."""
+            sino_cm = sino * sino_correction
+            if spectrum_idx < len(bhc_correctors):
+                return bhc_correctors[spectrum_idx].correct(sino_cm)
+            return sino_cm
+
         if self.xray_source_model['num_spectra']==2:
+            sino1_corrected = _apply_bhc(self.data1, 0)
             image_1 = self.scanner.reconstruct_data(
-                self.data1 * sino_correction,
+                sino1_corrected,
                 full_range=True, append_air_turns=True)
+            del sino1_corrected
 
             self.logger.info("Reconstructed LAC Image 1 ...")
 
+            sino2_corrected = _apply_bhc(self.data2, 1)
             image_2 = self.scanner.reconstruct_data(
-                self.data2 * sino_correction,
+                sino2_corrected,
                 full_range=True, append_air_turns=True)
+            del sino2_corrected
             self.logger.info("Reconstructed LAC Image 2 ...")
 
             del self.data1, self.data2
         elif self.xray_source_model['num_spectra']==1:
+            sino_corrected = _apply_bhc(self.data, 0)
             image_1 = self.scanner.reconstruct_data(
-                self.data * sino_correction,
+                sino_corrected,
                 full_range=True, append_air_turns=True)
+            del sino_corrected
             self.logger.info("Reconstructed LAC Image ...")
             del self.data
 
