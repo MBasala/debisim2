@@ -1,0 +1,22 @@
+name: Docker Image CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      CUDA_VAR:
+        description: 'Used as input for docker build to select CUDA build target and also tags final image for push to Dockerhub.'
+        required: false
+        default: 'cuda12.6'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Build the Docker image
+      run: docker build . --file Dockerfile --build-arg=${{ inputs.CUDA_VAR }} --tag fly0ut/debisim2p5:${{ inputs.CUDA_VAR }} --tag fly0ut/debisim2p5:latest
+    - name: Login to DockerHub
+      run: docker login -u fly0ut --password-stdin <<< "$DOCKERHUB_TOKEN"
+      env:
+        DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    - name: push to Dockerhub
+      run: docker push fly0ut/debisim2p5 --all-tags
