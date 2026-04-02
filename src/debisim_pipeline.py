@@ -68,7 +68,8 @@ from lib.forward_model.scanner_template import ScannerTemplate
 from lib.forward_model.scatter_simulator import ScatterSimulator
 from lib.decomposer.cdm_decomposer import CDMDecomposer
 from lib.misc.util import (save_fits_data, save_fits_data_async, flush_async_io,
-                            read_fits_data, create_gif, get_logger)
+                            read_fits_data, create_gif, get_logger,
+                            _get_io_pool)
 
 if torch.cuda.is_available():
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
@@ -971,7 +972,8 @@ class DEBISimPipeline(object):
                                       add_system_noise=True,
                                       system_gain=5e-3,
                                       spectrum=1,
-                                      slice_no=150
+                                      slice_no=150,
+                                      sinogram_buffer=None
                                       ):
         """
         ------------------------------------------------------------------------
@@ -990,12 +992,16 @@ class DEBISimPipeline(object):
         :param spectrum:            index of the spectrum as specified in self.
                                     xray_source_model.
         :param slice_no:            Slice to which scatter is to be added.
+        :param sinogram_buffer:     Optional pre-computed sinogram array.
+                                    If provided, avoids re-reading from disk.
 
         :return
         ------------------------------------------------------------------------
         """
 
-        if not os.path.exists(self.f_loc['sino_file']%spectrum):
+        if sinogram_buffer is not None:
+            sino_buf = sinogram_buffer
+        elif not os.path.exists(self.f_loc['sino_file']%spectrum):
             sino_buf = self.generate_polychromatic_ct_projection(
                 add_poisson_noise=add_poisson_noise,
                 add_system_noise=add_system_noise,
@@ -1003,15 +1009,10 @@ class DEBISimPipeline(object):
                 spectrum=spectrum
             )
         else:
-            sino_buf = None
-
-        if sino_buf is not None:
-            self.sino = sino_buf[slice_no, :, :].copy()
-        else:
             flush_async_io()
-            self.data = read_fits_data(self.f_loc['sino_file']%spectrum, 0)
-            self.sino = self.data[slice_no, :, :].copy()
-            del self.data
+            sino_buf = read_fits_data(self.f_loc['sino_file']%spectrum, 0)
+
+        self.sino = sino_buf[slice_no, :, :].copy()
 
         i = spectrum
         self.logger.info("Generating Polyenergetic Sinograms "
@@ -1157,6 +1158,11 @@ class DEBISimPipeline(object):
         self.logger.info("Xray data generated")
         self.logger.info("=" * 80)
 
+        # Stash raw (projector-format) sinograms so callers like
+        # run_fwd_model_with_motion_artifacts() can interleave from
+        # memory instead of re-reading from disk.
+        self._raw_sinograms = sinograms
+
         # Use in-memory sinograms directly — no disk read-back needed.
         # The async FITS writes are still running in background for persistence.
         if self.xray_source_model['num_spectra']==2:
@@ -1204,10 +1210,15 @@ class DEBISimPipeline(object):
 
         assert mode in ['bag', 'objects']
 
+        # Collect raw (projector-format) sinograms per sequence so the
+        # interleaving step can work from memory instead of re-reading FITS.
+        seq_sinograms = []
+
         self.logger.info("Creating Data for Original Virtual Bag ...")
         self.f_loc['sino_file'] = os.path.join(self.f_loc['sino_dir'],
                                                'sino_%i_seq_00.fits.gz')
         self.run_fwd_model(**fwd_model_args)
+        seq_sinograms.append(self._raw_sinograms)
 
         if mode=='bag':
 
@@ -1272,6 +1283,7 @@ class DEBISimPipeline(object):
                 self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
                                                         f"sino_%i_seq_{s:02d}.fits.gz")
                 self.run_fwd_model(**fwd_model_args)
+                seq_sinograms.append(self._raw_sinograms)
                 self.logger.info("="*80)
                 self.logger.info("="*80)
 
@@ -1371,28 +1383,27 @@ class DEBISimPipeline(object):
                 self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
                                                         f"sino_%i_seq_{s:02d}.fits.gz")
                 self.run_fwd_model(**fwd_model_args)
+                seq_sinograms.append(self._raw_sinograms)
                 self.logger.info("="*80)
                 self.logger.info("="*80)
 
                 del self.compton_image_3d
                 torch.cuda.empty_cache()
 
-        # Creating sinograms with motion artifacts
+        # Interleave motion-sequence sinograms from in-memory buffers.
+        # Each call to run_fwd_model() stashes raw sinograms in
+        # self._raw_sinograms — collect them per sequence to avoid
+        # re-reading from disk.
         if self.xray_source_model['num_spectra']==1:
 
             self.data = zeros((self.scanner.machine_geometry['det_row_count'],
                                self.scanner.recon_geometry['n_views'],
                                self.scanner.machine_geometry['det_col_count']))
 
-            for s in range(n_seqs):
-                self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
-                                                        f"sino_%i_seq_{s:02d}.fits.gz")
+            for s, raw_sinos in enumerate(seq_sinograms):
+                self.data[:, s::n_seqs, :] = raw_sinos[0][:, s::n_seqs, :]
 
-                data = read_fits_data(self.f_loc['sino_file'] % 1, 0)
-                self.data[:, s::n_seqs, :] = \
-                                    data[:, s::n_seqs,:]
-
-            self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
+            self.f_loc['sino_file'] = os.path.join(self.f_loc['sino_dir'],
                                                     'sino_%i.fits.gz')
             save_fits_data_async(self.f_loc['sino_file'] % 1,
                            self.data,
@@ -1410,15 +1421,9 @@ class DEBISimPipeline(object):
                                 self.scanner.machine_geometry['n_views'],
                                 self.scanner.machine_geometry['det_col_count']))
 
-            for s in range(bag_params['n_seqs']):
-                self.f_loc['sino_file'] = f"sino_%i_seq_{s:02d}.fits.gz"
-                data1 = read_fits_data(self.f_loc['sino_file'] % 1, 0)
-                data2 = read_fits_data(self.f_loc['sino_file'] % 2, 0)
-
-                self.data1[:, s::bag_params['n_seqs'], :] = \
-                                    data1[:, s::bag_params['n_seqs'], :]
-                self.data2[:, s::bag_params['n_seqs'], :] = \
-                                    data2[:, s::bag_params['n_seqs'], :]
+            for s, raw_sinos in enumerate(seq_sinograms):
+                self.data1[:, s::n_seqs, :] = raw_sinos[0][:, s::n_seqs, :]
+                self.data2[:, s::n_seqs, :] = raw_sinos[1][:, s::n_seqs, :]
 
             self.f_loc['sino_file'] = 'sino_%i.fits.gz'
             save_fits_data_async(self.f_loc['sino_file'] % 1, self.data1, self.compress_data)
@@ -1681,17 +1686,18 @@ class DEBISimPipeline(object):
                 # Cache in memory so save_dicom_output() doesn't re-read from disk
                 self._recon_images_cache = [image_1, image_2]
 
-                create_gif(os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
-                           self.gt_image_3d.cpu().numpy(),
-                           stride=5)
-
-                create_gif(os.path.join(self.f_loc['gif_dir'],
-                                        'recon_image_%i.gif'%1),
-                           np.clip(image_1+1000, 0, 3500), stride=2)
-                create_gif(os.path.join(self.f_loc['gif_dir'],
-                                        'recon_image_%i.gif'%2),
-                           np.clip(image_2+1000, 0, 3500), stride=2)
-                self.logger.info("Created GIFs for simulated volumes")
+                # GIF encoding is pure I/O — dispatch to background thread
+                _gif_pool = _get_io_pool()
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
+                    self.gt_image_3d.cpu().numpy(), stride=5)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
+                    np.clip(image_1+1000, 0, 3500), stride=2)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%2),
+                    np.clip(image_2+1000, 0, 3500), stride=2)
+                self.logger.info("Dispatched GIF creation to background")
 
             elif self.xray_source_model['num_spectra'] == 1:
                 image_1 *= scale
@@ -1707,15 +1713,20 @@ class DEBISimPipeline(object):
                                          self.f_loc['img_file']%1)
                 self.logger.info("Saving results to: "+out_fname)
                 save_fits_data_async(out_fname, image_1, self.compress_data)
-                create_gif(os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
-                           self.gt_image_3d.cpu().numpy(),
-                           stride=5)
 
-                create_gif(os.path.join(self.f_loc['gif_dir'],
-                                        'recon_image_%i.gif'%1),
-                           np.clip(image_1+1000, 0, 3500), stride=2)
+                # Cache in memory so save_dicom_output() doesn't re-read from disk
+                self._recon_images_cache = [image_1]
 
-                self.logger.info("Created GIFs for simulated volumes")
+                # GIF encoding is pure I/O — dispatch to background thread
+                _gif_pool = _get_io_pool()
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
+                    self.gt_image_3d.cpu().numpy(), stride=5)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
+                    np.clip(image_1+1000, 0, 3500), stride=2)
+
+                self.logger.info("Dispatched GIF creation to background")
 
             if self.DECOMPOSER_FLAG:
                 if self.scanner.machine_geometry['scanner_name'] in (
