@@ -14,11 +14,10 @@ dependencies = [
     "brt",
     "scipy",
     "astra-toolbox @ file:C:///Users/MBasa/PycharmProjects/debisim2/astra_toolbox-2.2.0-cp312-cp312-win_amd64.whl",
-    "pygpufit @ file:C:///Users/MBasa/PycharmProjects/debisim2/pyGpufit-1.2.0-py2.py3-none-win_amd64.whl",
+    "pygpufit @ file:C:///Users/MBasa/PycharmProjects/debisim2/pygpufit-1.2.0-py2.py3-none-any.whl",
     "trimesh",
     "scipy-stubs~=1.17.1",
     "tqdm",
-    "matplotlib",
     "pydicom",
     "astropy",
     "psutil"

@@ -19,8 +19,6 @@ __status__      = "Prototype"
 # ------------------------------------------------------------------------------
 
 
-import matplotlib as mpl
-# mpl.use('TkAgg')
 
 import scipy.ndimage.filters as fi
 import scipy.sparse as sp

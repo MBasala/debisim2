@@ -1,0 +1,11 @@
+# STL pooling image needs examples/stl_pools — don't exclude them
+# This file overrides the root .dockerignore for this Dockerfile only
+# (requires Docker BuildKit / buildx)
+
+results/
+deps/Gpufit_build/build/
+*.whl
+__pycache__/
+.git/
+.claude/
+benchmarks/results/

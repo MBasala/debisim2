@@ -29,7 +29,6 @@ import scipy.ndimage as sptx
 import torch
 import torch.nn as nn
 import astra
-import matplotlib.pyplot as plt
 from numpy import (array, zeros, zeros_like, ones, arange, loadtxt,
                    log, exp, clip, unique, moveaxis, newaxis, float32, int16,
                    isscalar, copy, save, savez_compressed)
@@ -37,7 +36,6 @@ from tqdm import tqdm
 from torch.distributions import Poisson, Normal
 from skimage.measure import regionprops
 from tabulate import tabulate
-from matplotlib import rcParams
 
 # ---------------------------------------------------------------------------
 # Pipeline dtype templates
@@ -70,9 +68,9 @@ from lib.forward_model.scanner_template import ScannerTemplate
 from lib.forward_model.scatter_simulator import ScatterSimulator
 from lib.decomposer.cdm_decomposer import CDMDecomposer
 from lib.misc.util import (save_fits_data, save_fits_data_async, flush_async_io,
-                            read_fits_data, create_gif, get_logger)
+                            read_fits_data, create_gif, get_logger,
+                            _get_io_pool)
 
-rcParams.update({'figure.autolayout': True})
 if torch.cuda.is_available():
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
 
@@ -333,6 +331,11 @@ class DEBISimPipeline(object):
         # by (1 / self.scale) to convert back to cm⁻¹ before saving.
         #
         self.scale = 0.1  # always cm→mm for noise model compatibility
+
+        # Beam hardening / metal artifact correction flags.
+        # Set via config or overridden before run_reconstructor().
+        self.apply_bhc = True   # water-based BHC (sinogram domain)
+        self.apply_mar = False  # NMAR metal artifact reduction
 
         print_table = []
 
@@ -969,7 +972,8 @@ class DEBISimPipeline(object):
                                       add_system_noise=True,
                                       system_gain=5e-3,
                                       spectrum=1,
-                                      slice_no=150
+                                      slice_no=150,
+                                      sinogram_buffer=None
                                       ):
         """
         ------------------------------------------------------------------------
@@ -988,12 +992,16 @@ class DEBISimPipeline(object):
         :param spectrum:            index of the spectrum as specified in self.
                                     xray_source_model.
         :param slice_no:            Slice to which scatter is to be added.
+        :param sinogram_buffer:     Optional pre-computed sinogram array.
+                                    If provided, avoids re-reading from disk.
 
         :return
         ------------------------------------------------------------------------
         """
 
-        if not os.path.exists(self.f_loc['sino_file']%spectrum):
+        if sinogram_buffer is not None:
+            sino_buf = sinogram_buffer
+        elif not os.path.exists(self.f_loc['sino_file']%spectrum):
             sino_buf = self.generate_polychromatic_ct_projection(
                 add_poisson_noise=add_poisson_noise,
                 add_system_noise=add_system_noise,
@@ -1001,15 +1009,10 @@ class DEBISimPipeline(object):
                 spectrum=spectrum
             )
         else:
-            sino_buf = None
-
-        if sino_buf is not None:
-            self.sino = sino_buf[slice_no, :, :].copy()
-        else:
             flush_async_io()
-            self.data = read_fits_data(self.f_loc['sino_file']%spectrum, 0)
-            self.sino = self.data[slice_no, :, :].copy()
-            del self.data
+            sino_buf = read_fits_data(self.f_loc['sino_file']%spectrum, 0)
+
+        self.sino = sino_buf[slice_no, :, :].copy()
 
         i = spectrum
         self.logger.info("Generating Polyenergetic Sinograms "
@@ -1155,6 +1158,11 @@ class DEBISimPipeline(object):
         self.logger.info("Xray data generated")
         self.logger.info("=" * 80)
 
+        # Stash raw (projector-format) sinograms so callers like
+        # run_fwd_model_with_motion_artifacts() can interleave from
+        # memory instead of re-reading from disk.
+        self._raw_sinograms = sinograms
+
         # Use in-memory sinograms directly — no disk read-back needed.
         # The async FITS writes are still running in background for persistence.
         if self.xray_source_model['num_spectra']==2:
@@ -1202,10 +1210,15 @@ class DEBISimPipeline(object):
 
         assert mode in ['bag', 'objects']
 
+        # Collect raw (projector-format) sinograms per sequence so the
+        # interleaving step can work from memory instead of re-reading FITS.
+        seq_sinograms = []
+
         self.logger.info("Creating Data for Original Virtual Bag ...")
         self.f_loc['sino_file'] = os.path.join(self.f_loc['sino_dir'],
                                                'sino_%i_seq_00.fits.gz')
         self.run_fwd_model(**fwd_model_args)
+        seq_sinograms.append(self._raw_sinograms)
 
         if mode=='bag':
 
@@ -1270,6 +1283,7 @@ class DEBISimPipeline(object):
                 self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
                                                         f"sino_%i_seq_{s:02d}.fits.gz")
                 self.run_fwd_model(**fwd_model_args)
+                seq_sinograms.append(self._raw_sinograms)
                 self.logger.info("="*80)
                 self.logger.info("="*80)
 
@@ -1369,28 +1383,27 @@ class DEBISimPipeline(object):
                 self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
                                                         f"sino_%i_seq_{s:02d}.fits.gz")
                 self.run_fwd_model(**fwd_model_args)
+                seq_sinograms.append(self._raw_sinograms)
                 self.logger.info("="*80)
                 self.logger.info("="*80)
 
                 del self.compton_image_3d
                 torch.cuda.empty_cache()
 
-        # Creating sinograms with motion artifacts
+        # Interleave motion-sequence sinograms from in-memory buffers.
+        # Each call to run_fwd_model() stashes raw sinograms in
+        # self._raw_sinograms — collect them per sequence to avoid
+        # re-reading from disk.
         if self.xray_source_model['num_spectra']==1:
 
             self.data = zeros((self.scanner.machine_geometry['det_row_count'],
                                self.scanner.recon_geometry['n_views'],
                                self.scanner.machine_geometry['det_col_count']))
 
-            for s in range(n_seqs):
-                self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
-                                                        f"sino_%i_seq_{s:02d}.fits.gz")
+            for s, raw_sinos in enumerate(seq_sinograms):
+                self.data[:, s::n_seqs, :] = raw_sinos[0][:, s::n_seqs, :]
 
-                data = read_fits_data(self.f_loc['sino_file'] % 1, 0)
-                self.data[:, s::n_seqs, :] = \
-                                    data[:, s::n_seqs,:]
-
-            self.f_loc['sino_file'] =  os.path.join(self.f_loc['sino_dir'],
+            self.f_loc['sino_file'] = os.path.join(self.f_loc['sino_dir'],
                                                     'sino_%i.fits.gz')
             save_fits_data_async(self.f_loc['sino_file'] % 1,
                            self.data,
@@ -1408,15 +1421,9 @@ class DEBISimPipeline(object):
                                 self.scanner.machine_geometry['n_views'],
                                 self.scanner.machine_geometry['det_col_count']))
 
-            for s in range(bag_params['n_seqs']):
-                self.f_loc['sino_file'] = f"sino_%i_seq_{s:02d}.fits.gz"
-                data1 = read_fits_data(self.f_loc['sino_file'] % 1, 0)
-                data2 = read_fits_data(self.f_loc['sino_file'] % 2, 0)
-
-                self.data1[:, s::bag_params['n_seqs'], :] = \
-                                    data1[:, s::bag_params['n_seqs'], :]
-                self.data2[:, s::bag_params['n_seqs'], :] = \
-                                    data2[:, s::bag_params['n_seqs'], :]
+            for s, raw_sinos in enumerate(seq_sinograms):
+                self.data1[:, s::n_seqs, :] = raw_sinos[0][:, s::n_seqs, :]
+                self.data2[:, s::n_seqs, :] = raw_sinos[1][:, s::n_seqs, :]
 
             self.f_loc['sino_file'] = 'sino_%i.fits.gz'
             save_fits_data_async(self.f_loc['sino_file'] % 1, self.data1, self.compress_data)
@@ -1530,23 +1537,52 @@ class DEBISimPipeline(object):
         # produces correct LAC for HU conversion.
         sino_correction = 1.0 / self.scale if abs(self.scale - 1.0) > 1e-6 else 1.0
 
+        # ---- Beam Hardening Correction (sinogram domain) --------------------
+        bhc_correctors = []
+        if getattr(self, 'apply_bhc', True):
+            try:
+                from lib.forward_model.bhc import BeamHardeningCorrector
+                for spec_path in self.xray_source_model['spectra']:
+                    bhc = BeamHardeningCorrector.from_debisim(
+                        self.mu, spec_path, max_kev=self.maxkV)
+                    bhc_correctors.append(bhc)
+                    self.logger.info(
+                        f"BHC LUT built: E_eff={bhc.e_eff:.1f} keV, "
+                        f"mu_mono={bhc.mu_mono:.4f} cm⁻¹")
+            except Exception as e:
+                self.logger.warning(f"BHC initialization failed: {e}")
+                bhc_correctors = []
+
+        def _apply_bhc(sino, spectrum_idx):
+            """Apply BHC to sinogram if corrector is available."""
+            sino_cm = sino * sino_correction
+            if spectrum_idx < len(bhc_correctors):
+                return bhc_correctors[spectrum_idx].correct(sino_cm)
+            return sino_cm
+
         if self.xray_source_model['num_spectra']==2:
+            sino1_corrected = _apply_bhc(self.data1, 0)
             image_1 = self.scanner.reconstruct_data(
-                self.data1 * sino_correction,
+                sino1_corrected,
                 full_range=True, append_air_turns=True)
+            del sino1_corrected
 
             self.logger.info("Reconstructed LAC Image 1 ...")
 
+            sino2_corrected = _apply_bhc(self.data2, 1)
             image_2 = self.scanner.reconstruct_data(
-                self.data2 * sino_correction,
+                sino2_corrected,
                 full_range=True, append_air_turns=True)
+            del sino2_corrected
             self.logger.info("Reconstructed LAC Image 2 ...")
 
             del self.data1, self.data2
         elif self.xray_source_model['num_spectra']==1:
+            sino_corrected = _apply_bhc(self.data, 0)
             image_1 = self.scanner.reconstruct_data(
-                self.data * sino_correction,
+                sino_corrected,
                 full_range=True, append_air_turns=True)
+            del sino_corrected
             self.logger.info("Reconstructed LAC Image ...")
             del self.data
 
@@ -1650,25 +1686,18 @@ class DEBISimPipeline(object):
                 # Cache in memory so save_dicom_output() doesn't re-read from disk
                 self._recon_images_cache = [image_1, image_2]
 
-                create_gif(os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
-                           self.gt_image_3d.cpu().numpy(),
-                           stride=5)
-
-                create_gif(os.path.join(self.f_loc['gif_dir'],
-                                        'recon_image_%i.gif'%1),
-                           np.clip(image_1+1000, 0, 3500), stride=2)
-                create_gif(os.path.join(self.f_loc['gif_dir'],
-                                        'recon_image_%i.gif'%2),
-                           np.clip(image_2+1000, 0, 3500), stride=2)
-                self.logger.info("Created GIFs for simulated volumes")
-
-                if plot_stats:
-                    gt_np = self.gt_image_3d.cpu().numpy() if torch.is_tensor(
-                        self.gt_image_3d) else self.gt_image_3d
-                    self.plot_baggage_statistics(
-                        gt_img=gt_np,
-                        recon_images=[image_1, image_2])
-                    self.logger.info("Plotted Baggage Statistics")
+                # GIF encoding is pure I/O — dispatch to background thread
+                _gif_pool = _get_io_pool()
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
+                    self.gt_image_3d.cpu().numpy(), stride=5)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
+                    np.clip(image_1+1000, 0, 3500), stride=2)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%2),
+                    np.clip(image_2+1000, 0, 3500), stride=2)
+                self.logger.info("Dispatched GIF creation to background")
 
             elif self.xray_source_model['num_spectra'] == 1:
                 image_1 *= scale
@@ -1684,23 +1713,20 @@ class DEBISimPipeline(object):
                                          self.f_loc['img_file']%1)
                 self.logger.info("Saving results to: "+out_fname)
                 save_fits_data_async(out_fname, image_1, self.compress_data)
-                create_gif(os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
-                           self.gt_image_3d.cpu().numpy(),
-                           stride=5)
 
-                create_gif(os.path.join(self.f_loc['gif_dir'],
-                                        'recon_image_%i.gif'%1),
-                           np.clip(image_1+1000, 0, 3500), stride=2)
+                # Cache in memory so save_dicom_output() doesn't re-read from disk
+                self._recon_images_cache = [image_1]
 
-                self.logger.info("Created GIFs for simulated volumes")
+                # GIF encoding is pure I/O — dispatch to background thread
+                _gif_pool = _get_io_pool()
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
+                    self.gt_image_3d.cpu().numpy(), stride=5)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
+                    np.clip(image_1+1000, 0, 3500), stride=2)
 
-                if plot_stats:
-                    gt_np = self.gt_image_3d.cpu().numpy() if torch.is_tensor(
-                        self.gt_image_3d) else self.gt_image_3d
-                    self.plot_baggage_statistics(
-                        gt_img=gt_np,
-                        recon_images=[image_1])
-                    self.logger.info("Plotted Baggage Statistics")
+                self.logger.info("Dispatched GIF creation to background")
 
             if self.DECOMPOSER_FLAG:
                 if self.scanner.machine_geometry['scanner_name'] in (
@@ -2023,202 +2049,6 @@ class DEBISimPipeline(object):
         torch.cuda.empty_cache()   # single cleanup after all GT images saved
     # --------------------------------------------------------------------------
 
-    def plot_baggage_statistics(self, gt_img=None, recon_images=None):
-        """
-        ------------------------------------------------------------------------
-        Plot per-material HU statistics from the reconstructed images.
-
-        :param gt_img:        ground-truth label volume (numpy).  If None,
-                              falls back to reading from disk (legacy path).
-        :param recon_images:  list of reconstructed HU volumes (numpy).
-                              Length must match num_spectra.  If None,
-                              falls back to reading from disk.
-        :return:
-        ------------------------------------------------------------------------
-        """
-
-        spec_num = self.xray_source_model['num_spectra']
-        lqd_labels = [x['lqd_param']['lqd_label']
-                      for x in self.sf_obj_list if x['lqd_flag']]
-
-        lbl_materials = {
-            **{x['label']: x['material'] for x in self.sf_obj_list},
-            **{x['lqd_param']['lqd_label']: x['lqd_param']['lqd_material']
-               for x in self.sf_obj_list if x['lqd_flag']}
-        }
-
-        max_label = builtins.max(list(lbl_materials.keys()))
-
-        # --- Resolve inputs: prefer in-memory, fall back to disk -------------
-        if gt_img is None:
-            flush_async_io()
-            gt_img = read_fits_data(os.path.join(self.f_loc['gt_image']), 0)
-
-        # GT label image must be integer for regionprops — FITS stores as float
-        gt_img = np.asarray(gt_img)
-        if not np.issubdtype(gt_img.dtype, np.integer):
-            gt_img = gt_img.astype(NP_INT)
-
-        if spec_num==1:
-
-            if recon_images is not None:
-                recon_img = recon_images[0]
-            else:
-                flush_async_io()
-                recon_img = read_fits_data(os.path.join(self.f_loc['image_dir'],
-                                                        self.f_loc['img_file']%1), 0)
-
-            r_shape, g_shape = recon_img.shape, gt_img.shape
-
-            if r_shape != g_shape:
-                r_buffer = np.ones_like(gt_img)*(-1000)
-
-                init_pt = [g//2-r//2 for g, r in zip(g_shape, r_shape)]
-
-                r_buffer[init_pt[0]:init_pt[0]+r_shape[0],
-                         init_pt[1]:init_pt[1]+r_shape[1],
-                         init_pt[2]:init_pt[2]+r_shape[2]] = recon_img.copy()
-                recon_img = r_buffer.copy()
-
-            rprops = regionprops(gt_img, recon_img)
-            rprop_dict = {r['label']: r for r in rprops}
-
-            headers = ['Label', 'Material',
-                       'Mean',
-                       'Min-Max', 'Vol', 'Bbox', 'Is Liquid']
-
-            r_labels = [r['label'] for r in rprops]
-            r_labels.sort()
-
-            print_table = []
-
-            for i in r_labels:
-                print_table.append(
-                    [i,
-                     lbl_materials[i],
-                     f"{rprop_dict[i]['mean_intensity']}",
-                     f"({rprop_dict[i]['min_intensity']}, "
-                     f"{rprop_dict[i]['max_intensity']})",
-                     f"{rprop_dict[i]['area']}",
-                     f"{rprop_dict[i]['bbox']}",
-                     i in lqd_labels
-                     ]
-                )
-
-            self.logger.info("\n" + tabulate(print_table,
-                                             headers=headers,
-                                             tablefmt='grid'))
-
-            plt.figure()
-            vectors = [recon_img[gt_img==i] for i in r_labels]
-            plt.boxplot(vectors, showfliers=False)
-            plt.xticks(r_labels,
-                       [f"{k}, {lbl_materials[k]}"
-                        for k in r_labels],
-                        rotation='vertical')
-            plt.xlabel("Material Labels")
-            plt.ylabel("Hounsfield Units (HU)")
-            plt.title("Baggage Statistics")
-            plt.savefig(os.path.join(self.f_loc['simulation_dir'],
-                                     'baggage_stats.png'))
-            plt.tight_layout()
-            plt.close()
-
-        if spec_num==2:
-
-            if recon_images is not None:
-                recon_img_1, recon_img_2 = recon_images[0], recon_images[1]
-            else:
-                flush_async_io()
-                recon_img_1 = read_fits_data(os.path.join(self.f_loc['image_dir'],
-                                                          self.f_loc['img_file']%1), 0)
-                recon_img_2 = read_fits_data(os.path.join(self.f_loc['image_dir'],
-                                                          self.f_loc['img_file']%2), 0)
-
-            r_shape, g_shape = recon_img_1.shape, gt_img.shape
-
-            if r_shape != g_shape:
-                # Use the larger of the two shapes as the target buffer
-                buf_shape = tuple(builtins.max(r, g) for r, g in zip(r_shape, g_shape))
-
-                def _embed(src, target_shape):
-                    buf = np.ones(target_shape, dtype=src.dtype) * (-1000)
-                    offset = [(t - s) // 2 for t, s in
-                              zip(target_shape, src.shape)]
-                    buf[offset[0]:offset[0]+src.shape[0],
-                        offset[1]:offset[1]+src.shape[1],
-                        offset[2]:offset[2]+src.shape[2]] = src
-                    return buf
-
-                recon_img_1 = _embed(recon_img_1, buf_shape)
-                recon_img_2 = _embed(recon_img_2, buf_shape)
-                gt_img = _embed(gt_img, buf_shape)
-
-
-            rprops1 = regionprops(gt_img, recon_img_1)
-            rprops2 = regionprops(gt_img, recon_img_2)
-
-            rprop1_dict = {r['label']: r for r in rprops1}
-            rprop2_dict = {r['label']: r for r in rprops2}
-
-            headers = ['Label', 'Material',
-                       'Mean',
-                       'Min-Max', 'Vol', 'Bbox', 'Is Liquid']
-
-            r_labels = [r['label'] for r in rprops1]
-            r_labels.sort()
-
-            print_table = []
-
-            lqd_labels = [x['lqd_param']['lqd_label']
-                          for x in self.sf_obj_list if x['lqd_flag']]
-
-            for i in r_labels:
-                print_table.append(
-                    [i,
-                     lbl_materials[i],
-                     f"{rprop1_dict[i]['mean_intensity']}, "
-                     f"{rprop2_dict[i]['mean_intensity']}",
-                     f"({rprop1_dict[i]['min_intensity']},{rprop1_dict[i]['max_intensity']}),"
-                     f"({rprop2_dict[i]['min_intensity']},{rprop2_dict[i]['max_intensity']})",
-                     f"{rprop1_dict[i]['area']}",
-                     f"{rprop1_dict[i]['bbox']}",
-                     i in lqd_labels
-                     ]
-                )
-
-            self.logger.info("\n" + tabulate(print_table,
-                                             headers=headers,
-                                             tablefmt='grid'))
-
-            plt.figure()
-            vectors = [recon_img_1[gt_img==i] for i in r_labels]
-            plt.boxplot(vectors, showfliers=False)
-            plt.xticks(r_labels,
-                       [f"{k}, {lbl_materials[k]}"
-                        for k in r_labels],
-                       rotation='vertical')
-            plt.xlabel("Material Labels")
-            plt.ylabel("Hounsfield Units (HU)")
-            plt.title("Baggage Statistics (S1)")
-            plt.savefig(os.path.join(self.f_loc['simulation_dir'],
-                                     'baggage_stats_1.png'))
-            plt.close()
-
-            plt.figure()
-            vectors = [recon_img_2[gt_img==i] for i in range(1, max_label+1)]
-            plt.boxplot(vectors, showfliers=False)
-            plt.xticks(r_labels,
-                       [f"{k}, {lbl_materials[k]}"
-                        for k in r_labels],
-                       rotation='vertical')
-            plt.xlabel("Material Labels")
-            plt.ylabel("Hounsfield Units (HU)")
-            plt.title("Baggage Statistics (S2)")
-            plt.savefig(os.path.join(self.f_loc['simulation_dir'],
-                                     'baggage_stats_2.png'))
-            plt.close()
-    # --------------------------------------------------------------------------
 
 
 # ==============================================================================
