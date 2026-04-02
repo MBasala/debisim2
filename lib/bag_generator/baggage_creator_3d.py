@@ -1055,7 +1055,7 @@ class BaggageImage3D(object):
 
         # Fit mask into the cavity (2*bb_h per axis) preserving aspect ratio
         cavity = 2 * self.bb_h
-        scale_factor = cavity / max(mask.shape)
+        scale_factor = cavity / builtins.max(mask.shape)
         if scale_factor != 1.0:
             mask = sktr.rescale(mask.astype(float), scale_factor,
                                 order=0, preserve_range=True).astype(bool)
@@ -1126,11 +1126,16 @@ class BaggageImage3D(object):
         self.bg_sf_list = []
         self.param_file = []
 
-        # Grid layout centred in the working volume.
-        # The final image is cropped from ws_bag to img_vol dimensions, so
-        # blocks must fit within the cropped region, not the full ws_bag.
-        crop_x = self.img_vol[0] if self.img_vol[0] < self.size else self.size
-        crop_y = self.img_vol[1] if self.img_vol[1] < self.size else self.size
+        # Compute the actual crop window on ws_bag, clamping to valid bounds.
+        # When img_vol > size (e.g. 1mm pixel / 512px FOV with size=256),
+        # the naive formula produces negative indices that NumPy wraps to the
+        # upper half of ws_bag, hiding most cylinders.
+        cx0 = builtins.max(0, self.size // 2 - self.img_vol[0] // 2)
+        cx1 = builtins.min(self.size, self.size // 2 + self.img_vol[0] // 2)
+        cy0 = builtins.max(0, self.size // 2 - self.img_vol[1] // 2)
+        cy1 = builtins.min(self.size, self.size // 2 + self.img_vol[1] // 2)
+        crop_x = cx1 - cx0   # actual voxels available in X within ws_bag
+        crop_y = cy1 - cy0   # actual voxels available in Y within ws_bag
 
         # Auto-shrink block_size and gap if the grid doesn't fit.
         total_x = rows * block_size + (rows - 1) * gap
@@ -1152,9 +1157,11 @@ class BaggageImage3D(object):
                 f"Grid too large for cropped volume ({crop_x}x{crop_y}), "
                 f"auto-scaled: block={block_size}, gap={gap}")
 
-        ctr = self.size // 2
-        start_x = ctr - total_x // 2
-        start_y = ctr - total_y // 2
+        # Centre cylinders within the crop region (ws_bag coordinates).
+        ctr_x = (cx0 + cx1) // 2
+        ctr_y = (cy0 + cy1) // 2
+        start_x = ctr_x - total_x // 2
+        start_y = ctr_y - total_y // 2
         # Z must be centred within img_vol[2] (not self.size) because
         # virtual_bag is cropped to [:img_vol[2]] at finalisation.
         z_ctr = self.img_vol[2] // 2
@@ -1211,18 +1218,26 @@ class BaggageImage3D(object):
         self.end_label = label
         self.lqd_count = label
 
-        # Finalize virtual_bag from ws_bag (same as create_baggage_image
-        # does, but without shape grammar or Object3D overhead)
-        self.virtual_bag = self.ws_bag[
-            self.size // 2 - self.img_vol[0] // 2:
-            self.size // 2 + self.img_vol[0] // 2,
-            self.size // 2 - self.img_vol[1] // 2:
-            self.size // 2 + self.img_vol[1] // 2,
-            :self.img_vol[2]
-        ].copy()
+        # Finalize virtual_bag from ws_bag using the clamped crop window.
+        # If ws_bag is smaller than img_vol (happens when pixel_size < 2mm),
+        # centre-pad the cropped content with zeros (air) to fill img_vol.
+        cropped = self.ws_bag[cx0:cx1, cy0:cy1, :self.img_vol[2]].copy()
+
+        if cropped.shape[:2] == (self.img_vol[0], self.img_vol[1]):
+            self.virtual_bag = cropped
+        else:
+            out = np.zeros((self.img_vol[0], self.img_vol[1], self.img_vol[2]),
+                           dtype=self.ws_bag.dtype)
+            ox = (self.img_vol[0] - cropped.shape[0]) // 2
+            oy = (self.img_vol[1] - cropped.shape[1]) // 2
+            out[ox:ox + cropped.shape[0],
+                oy:oy + cropped.shape[1],
+                :cropped.shape[2]] = cropped
+            self.virtual_bag = out
 
         self.logger.info(
             f"Calibration phantom complete: {n_blocks} blocks placed, "
+            f"ws_bag crop=({cx0}:{cx1},{cy0}:{cy1}), "
             f"virtual_bag shape={self.virtual_bag.shape}")
     # -------------------------------------------------------------------------
 
@@ -1377,7 +1392,7 @@ class BaggageImage3D(object):
                 # If the object is larger than the bag cavity, scale
                 # it down to fit (preserving aspect ratio)
                 cavity = 2 * self.bb_h
-                max_obj_dim = max(mask.shape)
+                max_obj_dim = builtins.max(mask.shape)
                 if max_obj_dim > cavity:
                     fit_scale = (cavity - 4) / max_obj_dim  # -4 for margin
                     mask = sktr.rescale(mask.astype(float), fit_scale,
@@ -2491,7 +2506,7 @@ class BaggageImage3D(object):
                             or self.ws_bag[tuple(bag_obj.curve_pts[3, :])] > 0
 
                 if SHEET_GROUND_FLAG or COLL_FLAG:
-                    ground_diff = max(x_dist-ground_y)
+                    ground_diff = np.max(x_dist-ground_y)
                     if ground_diff <= 0: ground_diff = 0
 
                     if x_dist[0]>ground_y:    bag_obj.curve_pts[0, 0] -= ground_diff

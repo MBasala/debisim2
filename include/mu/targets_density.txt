@@ -15,3 +15,6 @@ saline140	1.162
 rdx	1.820
 8cr13mov	7.750
 4150crmov	7.850
+tatp	0.950
+h2o2_30	1.111
+rdx_water	1.291
