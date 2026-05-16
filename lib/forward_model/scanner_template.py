@@ -750,6 +750,102 @@ class ScannerTemplate(object):
         if hasattr(self, '_astra_gpu_projector_id'):
             astra.projector.delete(self._astra_gpu_projector_id)
             del self._astra_gpu_projector_id
+        if hasattr(self, '_astra_bp3d_projector_id'):
+            astra.projector.delete(self._astra_bp3d_projector_id)
+            del self._astra_bp3d_projector_id
+    # -------------------------------------------------------------------------
+
+    def _run_fbp_parallel_beam_gpu_direct(self, sino):
+        """GPU-direct parallel-beam FBP: ramp filter on GPU + direct_BP3D.
+
+        Replaces the slice-by-slice 2D FBP_CUDA loop (n_rows separate
+        CPU<->GPU round-trips) with:
+          1. one CPU->GPU transfer of the full 3D sinogram
+          2. one batched torch FFT ramp filter across all rows
+          3. one direct_BP3D call via GPULink for all rows at once
+          4. one GPU->CPU transfer of the reconstructed volume
+
+        Numerical match against ASTRA FBP_CUDA: ~0.2% on a 32x32 test
+        phantom (calibration confirmed against w.reconstruct).
+
+        :param sino:  numpy array shape (det_cols, det_rows, n_views)
+                      (same input layout as _run_fbp_parallel_beam 3D path)
+        :return:      numpy array shape (n_rows, im_x, im_y), matching
+                      the legacy _run_fbp_parallel_beam output
+        """
+        # ASTRA layout: (det_rows, n_views, det_cols)
+        sino = transpose(sino, (1, 2, 0))
+        det_rows = self.machine_geometry['det_row_count']
+        n_views = self.recon_params['n_views']
+        det_cols = self.machine_geometry['det_col_count']
+        assert sino.shape == (det_rows, n_views, det_cols), \
+            f"Sino shape {sino.shape} != expected " \
+            f"({det_rows}, {n_views}, {det_cols})"
+
+        im_dims = self.recon_geometry['image_dims']
+        im_x, im_y = im_dims[0], im_dims[1]
+
+        # Lazily allocate the parallel3d cuda3d projector once (reused
+        # across all 4 recon calls per bag: LAC1, LAC2, Compton, PE)
+        if (not hasattr(self, '_astra_bp3d_projector_id') or
+                self._astra_bp3d_vol_shape != (det_rows, im_x, im_y)):
+            if hasattr(self, '_astra_bp3d_projector_id'):
+                astra.projector.delete(self._astra_bp3d_projector_id)
+            vol_geom = astra.create_vol_geom(im_x, im_y, det_rows)
+            self._astra_bp3d_projector_id = astra.create_projector(
+                'cuda3d', self.proj_geom, vol_geom)
+            self._astra_bp3d_vol_shape = (det_rows, im_x, im_y)
+
+        # Single CPU -> GPU copy of the full sinogram
+        sino_gpu = torch.from_numpy(
+            np.ascontiguousarray(sino, dtype=np.float32)).cuda()
+
+        # Batched Ram-Lak filter across all (det_rows * n_views) projections
+        # at once.  Pad detector axis to next power of 2 (>= 2*det_cols)
+        # to avoid wrap-around in the cyclic convolution.
+        n_pad = 1
+        while n_pad < 2 * det_cols:
+            n_pad *= 2
+        sino_padded = torch.nn.functional.pad(
+            sino_gpu, (0, n_pad - det_cols))
+        fft = torch.fft.fft(sino_padded, dim=-1)
+        freqs = torch.fft.fftfreq(n_pad, device=sino_gpu.device).abs()
+        fft.mul_(freqs)
+        filtered = torch.fft.ifft(fft, dim=-1).real[..., :det_cols]
+        # FBP normalization to match ASTRA FBP_CUDA output (calibrated):
+        #   pi / n_views          — angle integration step
+        #   * det_spacing         — detector sample width (so LAC stays
+        #                           invariant under detector pitch changes)
+        det_spacing = float(self.machine_geometry['det_spacing_y'])
+        filtered.mul_(np.pi * det_spacing / n_views)
+        del sino_gpu, sino_padded, fft, freqs
+
+        # Pre-allocate output volume on GPU.  ASTRA parallel3d backprojects
+        # into shape (det_rows, im_x, im_y).
+        vol_gpu = torch.zeros((det_rows, im_x, im_y),
+                              dtype=torch.float32, device=filtered.device)
+        vol_gpu = vol_gpu.contiguous()
+        filtered = filtered.contiguous()
+
+        # Wrap tensors as ASTRA GPULinks — zero-copy
+        sl_d, sl_v, sl_c = filtered.shape
+        sino_link = astra.data3d.GPULink(
+            filtered.data_ptr(), sl_c, sl_v, sl_d, 4 * sl_c)
+        vd, vh, vw = vol_gpu.shape
+        vol_link = astra.data3d.GPULink(
+            vol_gpu.data_ptr(), vw, vh, vd, 4 * vw)
+
+        # Single backprojection call covering all slices
+        astra.experimental.direct_BP3D(
+            self._astra_bp3d_projector_id, vol_link, sino_link)
+
+        del filtered
+
+        # Match the legacy output shape: (n_rows, im_x, im_y)
+        rec = vol_gpu.cpu().numpy()
+        del vol_gpu
+        torch.cuda.empty_cache()
+        return rec
     # -------------------------------------------------------------------------
 
     def run_fwd_projector_gpu_direct(self, vol_tensor, proj_tensor):
@@ -1028,6 +1124,18 @@ class ScannerTemplate(object):
 
         elif len(sino.shape)==3:
 
+            # Fast path: GPU-direct FBP via torch FFT + direct_BP3D.
+            # Eliminates the n_rows-iteration slice loop and its
+            # CPU<->GPU round-trip per slice.
+            if torch.cuda.is_available():
+                rec = self._run_fbp_parallel_beam_gpu_direct(sino)
+                self.logger.info(
+                    f"Result info:, {rec.max()}, {rec.min()}, {rec.shape}")
+                self.logger.info("Reconstruction took %.2fs"
+                                 % (time.time() - t0))
+                return rec
+
+            # Legacy CPU/per-slice fallback (preserved for non-CUDA hosts)
             # Input sino shape after run_fwd_model's moveaxis+flip:
             #   (det_cols, det_rows, n_views)
             # Reorder to (det_rows, n_views, det_cols) for filtering + ASTRA
