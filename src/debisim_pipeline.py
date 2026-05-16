@@ -1580,29 +1580,71 @@ class DEBISimPipeline(object):
             if basis_fn is not None:
                 cdm_sim.set_basis_functions(**basis_fn)
 
-            sino_pe = zeros_like(self.data1)
-            sino_c  = zeros_like(self.data2)
-            nrows   = self.data1.shape[1]
+            nrows = self.data1.shape[1]
 
             # The decomposer's basis functions (Klein-Nishina, PE=e^-3)
             # are defined for LAC in cm⁻¹.  Convert sinograms from
             # self.scale units (mm⁻¹) to cm⁻¹ before decomposition.
             decomp_scale = 1.0 / self.scale if abs(self.scale - 1.0) > 1e-6 else 1.0
 
-            for i in range(nrows):
-                self.logger.info("Row %d:" % i)
+            solver = decomposer_args['cdm_solver']
+            cdm_type = decomposer_args['cdm_type']
+
+            if solver == 'gpu' and nrows > 1:
+                # ---- Batched GPU path: all rows in a single GpuFit call ------
+                # GpuFit handles millions of independent fits efficiently.
+                # Stacking all rows into one call avoids nrows separate GPU
+                # kernel launches + data transfers.
+                self.logger.info(
+                    f"Decomposing {nrows} rows in a single batched GPU call")
+
+                # Stack all rows: shape (nbins, nrows, nangs) → flatten
+                # across rows so GpuFit sees nbins*nrows*nangs pixel pairs.
+                data1_scaled = self.data1 * decomp_scale
+                data2_scaled = self.data2 * decomp_scale
+
+                # Reshape to (nbins*nrows, nangs) per 2D slice convention,
+                # then let decompose_dect_sinograms flatten internally.
+                nbins, _, nangs = self.data1.shape
+
+                # Temporarily override sino_shape to match the full 3D volume
+                orig_shape = cdm_sim.sino_shape
+                orig_npxls = cdm_sim.n_sino_pxls
+                cdm_sim.sino_shape = (nbins * nrows, nangs)
+                cdm_sim.n_sino_pxls = nbins * nrows * nangs
+
                 cdm_sim.init_val = decomposer_args['init_val']
-                # try:
-                sino_pe[:, i, :], sino_c[:, i, :] = \
+                sino_pe_flat, sino_c_flat = \
                     cdm_sim.decompose_dect_sinograms(
-                        self.data1[:, i, :] * decomp_scale,
-                        self.data2[:, i, :] * decomp_scale,
-                        solver=decomposer_args['cdm_solver'],
-                        type=decomposer_args['cdm_type']
+                        data1_scaled.reshape(nbins * nrows, nangs),
+                        data2_scaled.reshape(nbins * nrows, nangs),
+                        solver='gpu',
+                        type=cdm_type
                     )
-                # except:
-                #     self.logger.info("GPufit error encountered")
+
+                # Restore and reshape back to 3D
+                cdm_sim.sino_shape = orig_shape
+                cdm_sim.n_sino_pxls = orig_npxls
+                sino_pe = sino_pe_flat.reshape(nbins, nrows, nangs)
+                sino_c = sino_c_flat.reshape(nbins, nrows, nangs)
+
+                del data1_scaled, data2_scaled
                 torch.cuda.empty_cache()
+            else:
+                # ---- Row-by-row fallback (CPU / vec solver) ------------------
+                sino_pe = zeros_like(self.data1)
+                sino_c = zeros_like(self.data2)
+
+                for i in range(nrows):
+                    self.logger.info("Row %d:" % i)
+                    cdm_sim.init_val = decomposer_args['init_val']
+                    sino_pe[:, i, :], sino_c[:, i, :] = \
+                        cdm_sim.decompose_dect_sinograms(
+                            self.data1[:, i, :] * decomp_scale,
+                            self.data2[:, i, :] * decomp_scale,
+                            solver=solver,
+                            type=cdm_type
+                        )
 
             self.sino_c = sino_c.copy()
             self.sino_pe = sino_pe.copy()
