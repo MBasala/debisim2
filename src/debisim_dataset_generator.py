@@ -159,6 +159,11 @@ def _process_single_bag(args_tuple):
                 _compress_dicom_dir(simulator.f_loc['image_dir'],
                                     simulator.logger)
 
+        # Flush any pending async FITS writes (non-monolithic path) before
+        # the worker exits, so writes complete while the process is alive.
+        from lib.misc.util import flush_async_io
+        flush_async_io()
+
         # Finalize a monolithic archive (flush + close writer thread)
         if monolithic_output and simulator.archive is not None:
             simulator.archive.close()
@@ -438,6 +443,10 @@ def run_xray_dataset_generator(num_bags,
             if compress_dicom and not monolithic_output:
                 _compress_dicom_dir(simulator.f_loc['image_dir'],
                                     simulator.logger)
+
+        # Flush any pending async FITS writes before cleanup
+        from lib.misc.util import flush_async_io
+        flush_async_io()
 
         # Finalize monolithic archive (flush + close writer thread)
         if monolithic_output and simulator.archive is not None:

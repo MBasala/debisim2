@@ -20,7 +20,6 @@ __status__    = "Prototype"
 import builtins
 import os
 import pickle
-import threading
 import time
 import warnings
 warnings.filterwarnings('ignore')
@@ -928,19 +927,23 @@ class DEBISimPipeline(object):
             np.take(lac_lut_cpu[:, k], voxel_mat_idx_safe_cpu, out=buf)
             buf[bg_mask_cpu] = 0.0
 
+        # Single-thread pool reused across all keV steps — avoids spawning
+        # 150+ bare threads.  The pool thread stays alive between submissions.
+        from concurrent.futures import ThreadPoolExecutor
+        prefetch_pool = ThreadPoolExecutor(max_workers=1,
+                                           thread_name_prefix='kev_prefetch')
+
         # Seed the first buffer synchronously
         _prefetch(ref_buf_a, 0)
 
         for i, e in enumerate(kev_iter):
             # ref_buf_a holds the ready image for this keV step.
             # Start prefetching the NEXT keV into ref_buf_b while ASTRA runs.
-            prefetch_thread = None
+            prefetch_fut = None
             if i + 1 < len(kev_list):
                 next_k = kev_list[i + 1] - self.keV_range[0]
-                prefetch_thread = threading.Thread(
-                    target=_prefetch, args=(ref_buf_b, next_k),
-                    daemon=True, name='kev-prefetch')
-                prefetch_thread.start()
+                prefetch_fut = prefetch_pool.submit(_prefetch, ref_buf_b,
+                                                    next_k)
 
             # --- ASTRA GPU — forward projection (GIL released in C code) ------
             proj_np = self.scanner.run_fwd_projector(ref_buf_a)
@@ -966,8 +969,8 @@ class DEBISimPipeline(object):
             pc_sum += scale
 
             # Wait for prefetch to finish before swapping buffers
-            if prefetch_thread is not None:
-                prefetch_thread.join()
+            if prefetch_fut is not None:
+                prefetch_fut.result()
 
             # Swap buffers — ref_buf_b (now filled) becomes the active buffer
             ref_buf_a, ref_buf_b = ref_buf_b, ref_buf_a
@@ -975,6 +978,7 @@ class DEBISimPipeline(object):
             kev_iter.set_description(
                 f"Processing Energy Level, {e} keV:\t", refresh=True)
 
+        prefetch_pool.shutdown(wait=False)
         del ref_buf_a, ref_buf_b
         del voxel_mat_idx_safe_cpu, bg_mask_cpu, lac_lut_cpu
 

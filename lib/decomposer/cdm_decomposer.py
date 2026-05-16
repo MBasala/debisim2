@@ -49,6 +49,7 @@ Decomposition.
 """
 
 from lib.decomposer.de_decomposer import *
+from lib.misc.multi_processor import MultiProcessor, worker
 
 try:
     import pygpufit.gpufit as gf

@@ -1,3 +1,4 @@
+import builtins
 import sys
 import io
 import subprocess
@@ -24,7 +25,6 @@ from skimage.transform import rescale
 
 from lib.__init__ import *
 from sys import stdout as stdout
-from lib.misc.multi_processor import *
 from PIL import Image
 
 
@@ -278,36 +278,14 @@ def _get_io_pool():
     return _io_pool
 
 
-def save_fits_data_async(file_path, out_image, compress=False):
-    """
-    Submit a FITS save to the background I/O thread pool.
-
-    The image array is copied before submission so the caller can safely
-    reuse or free the memory immediately.
-
-    :param file_path:   path to the fits file
-    :param out_image:   numpy array to save
-    :param compress:    whether to use FITS compression
-    """
-    data_copy = out_image.copy()
-    fut = _get_io_pool().submit(save_fits_data, file_path, data_copy, compress)
-    with _io_lock:
-        # Prune completed futures — surface any write failures immediately
-        surviving = []
-        for f in _io_futures:
-            if f.done():
-                exc = f.exception()
-                if exc is not None:
-                    raise exc
-            else:
-                surviving.append(f)
-        surviving.append(fut)
-        _io_futures[:] = surviving
-
-
 def submit_async_io(fn, *args, **kwargs):
-    """Submit an arbitrary callable to the I/O thread pool and track its
-    future so that flush_async_io() waits for it."""
+    """Submit a callable to the I/O thread pool and track its future.
+
+    Completed futures are pruned on each call; any exception from a
+    finished write is raised immediately so failures are not silently lost.
+
+    :returns: ``concurrent.futures.Future``
+    """
     fut = _get_io_pool().submit(fn, *args, **kwargs)
     with _io_lock:
         surviving = []
@@ -323,9 +301,23 @@ def submit_async_io(fn, *args, **kwargs):
     return fut
 
 
-def flush_async_io():
+def save_fits_data_async(file_path, out_image, compress=False):
+    """Submit a FITS save to the background I/O thread pool.
+
+    The image array is copied before submission so the caller can safely
+    reuse or free the memory immediately.
+
+    :param file_path:   path to the fits file
+    :param out_image:   numpy array to save
+    :param compress:    whether to use FITS compression
     """
-    Block until all pending async I/O (FITS writes, GIFs, etc.) has completed.
+    data_copy = out_image.copy()
+    submit_async_io(save_fits_data, file_path, data_copy, compress)
+
+
+def flush_async_io():
+    """Block until all pending async I/O has completed.
+
     Call this before the pipeline exits or before reading back saved files.
     Raises the first exception encountered, if any.
     """
@@ -455,7 +447,7 @@ class MonolithicArchive:
         self._written_lock = threading.Lock()
         self._written_count = [0]   # mutable container shared with writer
         self._enqueued_count = 0
-        self._enqueued_bytes = 0
+        self._total_enqueued_bytes = 0
 
         # Standard thread queue — items pass by reference, no pickling
         import queue
@@ -505,12 +497,16 @@ class MonolithicArchive:
         self._enqueue(arcname, data_bytes)
 
     # ---- internal: buffering + resource-aware flush ---------------------
+    # _total_enqueued_bytes and _enqueued_count are only read/written on
+    # the main thread (inside _enqueue / _wait_for_writer_drain), so they
+    # do not need a lock.  The writer thread communicates progress via
+    # _written_count (protected by _written_lock) and _written_event.
 
     def _enqueue(self, arcname, data_bytes):
         """Put item on the writer queue. Block only if RAM is tight."""
         self._queue.put((arcname, data_bytes))
         self._enqueued_count += 1
-        self._enqueued_bytes += len(data_bytes)
+        self._total_enqueued_bytes += len(data_bytes)
 
         # If RAM is getting tight, wait for writer to catch up
         if self._ram_pressure():
@@ -519,25 +515,30 @@ class MonolithicArchive:
     def _ram_pressure(self):
         """True if estimated in-flight bytes exceed available RAM limit."""
         avail = psutil.virtual_memory().available
-        return self._enqueued_bytes > avail * self._ram_limit
+        return self._inflight_bytes_estimate() > avail * self._ram_limit
+
+    def _inflight_bytes_estimate(self):
+        """Estimate bytes still queued (not yet consumed by writer)."""
+        with self._written_lock:
+            written = self._written_count[0]
+        pending = builtins.max(0, self._enqueued_count - written)
+        if self._enqueued_count == 0:
+            return 0
+        avg_size = self._total_enqueued_bytes / self._enqueued_count
+        return avg_size * pending
 
     def _wait_for_writer_drain(self):
         """Block until the writer has processed enough items to relieve
         RAM pressure.  This is the ONLY sync point during normal operation.
         """
         if self._logger:
+            est = self._inflight_bytes_estimate()
             self._logger.info(
                 f"MonolithicArchive: RAM pressure — waiting for writer "
-                f"(in-flight ~{self._enqueued_bytes / 1e9:.1f} GB)")
+                f"(in-flight ~{est / 1e9:.1f} GB)")
         while self._ram_pressure():
             self._written_event.wait(timeout=0.1)
             self._written_event.clear()
-            with self._written_lock:
-                written = self._written_count[0]
-            if written > 0 and self._enqueued_count > 0:
-                avg_size = self._enqueued_bytes / self._enqueued_count
-                self._enqueued_bytes = builtins.max(
-                    0, avg_size * (self._enqueued_count - written))
 
     # ---- lifecycle ------------------------------------------------------
 
