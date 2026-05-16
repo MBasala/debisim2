@@ -374,9 +374,22 @@ class CDMDecomposer(DEDecomposer):
             GFw_ac    = ascontiguousarray(GFw, dtype=np.float32)
             GFinit_ac = ascontiguousarray(GFinit, dtype=np.float32)
 
-            GFres = gf.fit(
-                GFdata_ac, GFw_ac, gf.ModelID.COMPTON_PE, GFinit_ac, GFtol,
-                GFmaxIter, None, gf.EstimatorID.LSE, GFui_ac)
+            try:
+                GFres = gf.fit(
+                    GFdata_ac, GFw_ac, gf.ModelID.COMPTON_PE, GFinit_ac,
+                    GFtol, GFmaxIter, None, gf.EstimatorID.LSE, GFui_ac)
+            except RuntimeError as exc:
+                if 'no kernel image' in str(exc):
+                    raise RuntimeError(
+                        "pygpufit cannot run on this GPU: the installed "
+                        "wheel was built for a different CUDA compute "
+                        "capability.  Rebuild pygpufit from deps/gpufit/ "
+                        "for your GPU's arch (check `nvidia-smi --query-gpu="
+                        "compute_cap`) and reinstall, or set "
+                        "decomposer='none' in your config to skip DECT "
+                        "decomposition.  Original error: " + str(exc)
+                    ) from exc
+                raise
 
             GF_out = np.array(GFres[0], copy=True)
 
@@ -425,9 +438,20 @@ class CDMDecomposer(DEDecomposer):
             GFdata = ascontiguousarray(GFdata, dtype=float32)
             GFw = ascontiguousarray(GFw, dtype=float32)
             GFinit = ascontiguousarray(GFinit, dtype=float32)
-            GFres = gf.fit(
-                GFdata, GFw, gf.ModelID.MATERIAL_BASIS, GFinit, GFtol,
-                GFmaxIter, None, gf.EstimatorID.LSE, GFui)
+            try:
+                GFres = gf.fit(
+                    GFdata, GFw, gf.ModelID.MATERIAL_BASIS, GFinit, GFtol,
+                    GFmaxIter, None, gf.EstimatorID.LSE, GFui)
+            except RuntimeError as exc:
+                if 'no kernel image' in str(exc):
+                    raise RuntimeError(
+                        "pygpufit cannot run on this GPU: the installed "
+                        "wheel was built for a different CUDA compute "
+                        "capability.  Rebuild pygpufit from deps/gpufit/ "
+                        "for your GPU's arch, or set decomposer='none'.  "
+                        "Original error: " + str(exc)
+                    ) from exc
+                raise
             sino_c = GFres[0][:, 0].flatten().reshape(self.sino_shape)
             sino_p = GFres[0][:, 1].flatten().reshape(self.sino_shape)
 
