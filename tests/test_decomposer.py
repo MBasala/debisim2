@@ -58,7 +58,7 @@ class TestDecomposerInit:
         configs = glob.glob(os.path.join(
             os.path.dirname(__file__), '..', 'configs', '*.py'))
         for cfg in configs:
-            with open(cfg) as f:
+            with open(cfg, encoding='utf-8') as f:
                 content = f.read()
             if 'init_val' in content:
                 assert 'init_val=(0, 0)' not in content, \
