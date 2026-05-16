@@ -1728,11 +1728,29 @@ class DEBISimPipeline(object):
                 bhc_correctors = []
 
         def _apply_bhc(sino, spectrum_idx):
-            """Apply BHC to sinogram if corrector is available."""
-            sino_cm = sino * sino_correction
+            """Apply BHC to sinogram if corrector is available.
+
+            The BHC LUT is built in PHYSICAL cm⁻¹·cm line-integral units
+            and has a calibrated max around s_poly_max ≈ 9 (= ~50 cm of
+            water-equivalent attenuation).  The pipeline scales sino by
+            sino_correction (=10 for self.scale=0.1) for the recon chain's
+            unit-conversion, but if we apply that scale BEFORE BHC the
+            input lands ~10× above the LUT's calibrated range, which
+            clips every non-air material to the same LUT-max value and
+            destroys all material distinction (steel and water both end
+            up reconstructing as near-zero LAC).
+
+            Fix: feed BHC the unscaled (physical) sino, then rescale
+            the linearized output by sino_correction to match the
+            recon chain's expected magnitude.
+            """
             if spectrum_idx < len(bhc_correctors):
-                return bhc_correctors[spectrum_idx].correct(sino_cm)
-            return sino_cm
+                # BHC sees physical line integrals; output stays linear,
+                # so post-multiplying by sino_correction is dimensionally
+                # equivalent to the pre-scaled path (without clipping).
+                return bhc_correctors[spectrum_idx].correct(sino) \
+                       * sino_correction
+            return sino * sino_correction
 
         if self.xray_source_model['num_spectra']==2:
             sino1_corrected = _apply_bhc(self.data1, 0)
