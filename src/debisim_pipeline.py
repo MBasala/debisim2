@@ -831,11 +831,8 @@ class DEBISimPipeline(object):
                     _label_to_mat_idx[sf_obj['lqd_param']['lqd_label']] = \
                         mat_indices[lqd_mat]
 
-        # ---- Build LUT + index maps on BOTH CPU and GPU ----------------------
-        # CPU RAM is plentiful (64 GB) so we duplicate the index map:
-        #   - CPU copy:  feeds ASTRA via np.take (no GPU→CPU transfer per keV)
-        #   - GPU copy:  feeds torch post-processing (exp, noise, accumulate)
-        # The LUT itself is tiny (n_mats × n_keV ≈ 7 KB).
+        # ---- Build LUT + index map on GPU ------------------------------------
+        # All data lives on GPU end-to-end.  No CPU↔GPU transfers in the loop.
         _gt_device = self.gt_image_3d.device
 
         _label_to_mat_idx_gpu = torch.tensor(
@@ -845,35 +842,32 @@ class DEBISimPipeline(object):
         del gt_clamped, _label_to_mat_idx_gpu
 
         bg_mask_gpu = (voxel_mat_idx_gpu < 0)
-        voxel_mat_idx_safe_gpu = voxel_mat_idx_gpu.clamp(min=0)
+        voxel_mat_idx_safe_gpu = voxel_mat_idx_gpu.clamp(min=0).long()
         del voxel_mat_idx_gpu
 
-        # CPU copies for ASTRA (duplicated — CPU RAM is cheap)
-        voxel_mat_idx_safe_cpu = voxel_mat_idx_safe_gpu.cpu().numpy()
-        bg_mask_cpu = bg_mask_gpu.cpu().numpy()
-
-        # Pre-build per-keV LAC lookup table on both CPU and GPU
+        # Pre-build per-keV LAC lookup table on GPU (n_mats × n_keV ≈ 7 KB)
         n_kev = len(self.keV_range[:curr_spectrum.size])
         n_mats = len(material_list)
-        # Note: ASTRA requires float32 input regardless of NP_FLOAT.
-        # The LUT is built at NP_FLOAT precision, then the ref_image fed to
-        # ASTRA is always np.float32 (cast at the projector boundary).
-        lac_lut_cpu = np.zeros((n_mats, n_kev), dtype=NP_FLOAT)
+        lac_lut_cpu = np.zeros((n_mats, n_kev), dtype=np.float32)
         for mat in material_list:
             idx = mat_indices[mat]
             for ki in range(n_kev):
                 lac_lut_cpu[idx, ki] = self.material_curve[mat][ki]
-        lac_lut_gpu = torch.tensor(lac_lut_cpu, device=_gt_device)
+        lac_lut_gpu = torch.tensor(lac_lut_cpu, device=_gt_device,
+                                   dtype=torch.float32)
+        del lac_lut_cpu
 
-        # Pre-allocate reusable CPU buffer for ASTRA input (avoids alloc per keV)
-        ref_image_cpu = np.empty(voxel_mat_idx_safe_cpu.shape, dtype=np.float32)
+        # Detect whether the GPU-direct ASTRA path is available
+        is_parallel_beam = (
+            torch.cuda.is_available()
+            and hasattr(self.scanner, 'proj_geom')
+            and self.scanner.proj_geom is not None
+            and self.scanner.proj_geom.get('type') == 'parallel3d'
+        )
 
         # ---- Temporarily move large tensors off GPU --------------------------
-        # gt_image_3d and compton_image_3d are ~2 GB each on a 1024×1024
-        # volume.  They're no longer needed until after the energy loop.
-        # GPU now holds: voxel_mat_idx_safe_gpu (~350 MB) + bg_mask_gpu (~90 MB)
-        #              + lac_lut_gpu (~7 KB) + projection_buffer (~130 MB)
-        #              ≈ 570 MB, leaving ~11 GB for ASTRA.
+        # gt_image_3d / compton_image_3d are large (~2 GB on a 1024³ volume)
+        # and not needed until after the energy loop.
         self.gt_image_3d = self.gt_image_3d.cpu()
         self.compton_image_3d = self.compton_image_3d.cpu()
         if hasattr(self, 'pe_image_3d') and torch.is_tensor(self.pe_image_3d):
@@ -881,11 +875,7 @@ class DEBISimPipeline(object):
         if hasattr(self, 'zeff_image_3d') and torch.is_tensor(self.zeff_image_3d):
             self.zeff_image_3d = self.zeff_image_3d.cpu()
 
-        # The energy loop uses CPU copies for ASTRA, so free the GPU
-        # index/mask tensors too — they were only needed to build the CPU copies.
-        del voxel_mat_idx_safe_gpu, bg_mask_gpu, lac_lut_gpu
-
-        # Free torch's cached GPU memory so ASTRA can use the full VRAM.
+        # Free torch's cached GPU memory so ASTRA can use the full VRAM
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             try:
@@ -901,86 +891,129 @@ class DEBISimPipeline(object):
                     pass
         # --------------------------------------------------------------------------
 
-        # Accumulation buffer on GPU — post-processing (exp, noise) runs on GPU.
+        # Accumulation buffer on GPU
         proj_shape = (self.scanner_geometry['det_row_count'],
                       self.reconstruction_geometry['n_views'],
                       self.scanner_geometry['det_col_count'])
-        projection_buffer_gpu = torch.zeros(proj_shape, dtype=T_FLOAT,
+        projection_buffer_gpu = torch.zeros(proj_shape, dtype=torch.float32,
                                             device=_gt_device)
-
-        # ---- Per-keV LUT gather + ASTRA projection ----------------------------
-        # Double-buffered pipeline: a prefetch thread prepares the next
-        # ref_image on CPU while ASTRA projects the current one on GPU.
-        # ASTRA's C extension releases the GIL during CUDA kernel execution,
-        # so the CPU LUT gather runs truly concurrently with GPU work.
-        vol_shape = voxel_mat_idx_safe_cpu.shape
-
-        # Two buffers — one for ASTRA, one being filled by the prefetch thread
-        ref_buf_a = np.empty(vol_shape, dtype=np.float32)
-        ref_buf_b = np.empty(vol_shape, dtype=np.float32)
 
         kev_list = list(self.keV_range[:curr_spectrum.size])
         kev_iter = tqdm(kev_list)
 
-        # Prefetch helper: fills a buffer with the LAC image for keV index k
-        def _prefetch(buf, k):
-            np.take(lac_lut_cpu[:, k], voxel_mat_idx_safe_cpu, out=buf)
-            buf[bg_mask_cpu] = 0.0
+        if is_parallel_beam:
+            # ============ GPU-DIRECT FAST PATH ================================
+            # No CPU↔GPU transfers in the loop.  Per keV:
+            #   1. GPU LUT lookup → ref_image_gpu (single torch op)
+            #   2. direct_FP3D reads ref_image_gpu, writes proj_curr_gpu
+            #   3. Beer-Lambert + noise + accumulate on GPU
+            self.logger.info(
+                "Using GPU-direct ASTRA path (direct_FP3D + GPULink)")
 
-        # Single-thread pool reused across all keV steps — avoids spawning
-        # 150+ bare threads.  The pool thread stays alive between submissions.
-        from concurrent.futures import ThreadPoolExecutor
-        prefetch_pool = ThreadPoolExecutor(max_workers=1,
-                                           thread_name_prefix='kev_prefetch')
+            # Pre-allocate GPU tensors.  ASTRA wants (D, H, W) volume layout
+            # and (det_rows, n_views, det_cols) projection layout.
+            h, w, d = voxel_mat_idx_safe_gpu.shape
+            ref_image_gpu = torch.empty((d, h, w), dtype=torch.float32,
+                                        device=_gt_device).contiguous()
+            proj_curr_gpu = torch.empty(proj_shape, dtype=torch.float32,
+                                        device=_gt_device).contiguous()
 
-        # Seed the first buffer synchronously
-        _prefetch(ref_buf_a, 0)
+            # Pre-permute the index/mask to (D, H, W) once (matches ASTRA layout)
+            voxel_idx_dhw = voxel_mat_idx_safe_gpu.permute(2, 0, 1).contiguous()
+            bg_mask_dhw = bg_mask_gpu.permute(2, 0, 1).contiguous()
+            del voxel_mat_idx_safe_gpu, bg_mask_gpu
 
-        for i, e in enumerate(kev_iter):
-            # ref_buf_a holds the ready image for this keV step.
-            # Start prefetching the NEXT keV into ref_buf_b while ASTRA runs.
-            prefetch_fut = None
-            if i + 1 < len(kev_list):
-                next_k = kev_list[i + 1] - self.keV_range[0]
-                prefetch_fut = prefetch_pool.submit(_prefetch, ref_buf_b,
-                                                    next_k)
+            for e in kev_iter:
+                k = e - self.keV_range[0]
 
-            # --- ASTRA GPU — forward projection (GIL released in C code) ------
-            proj_np = self.scanner.run_fwd_projector(ref_buf_a)
+                # GPU LUT gather: ref_image_gpu[i,j,l] = lac_lut[idx[i,j,l], k]
+                # Single fused GPU op — no Python loop, no transfers.
+                ref_image_gpu = lac_lut_gpu[voxel_idx_dhw, k]
+                ref_image_gpu = ref_image_gpu.masked_fill(bg_mask_dhw, 0.0)
+                ref_image_gpu = ref_image_gpu.contiguous()
 
-            # --- torch GPU — Beer-Lambert + noise + accumulate ----------------
-            curr = torch.as_tensor(proj_np, device=_gt_device)
-            del proj_np
+                # ASTRA reads ref_image_gpu, writes proj_curr_gpu — no copies
+                self.scanner.run_fwd_projector_gpu_direct(
+                    ref_image_gpu, proj_curr_gpu)
 
-            scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
-            curr.neg_()
-            curr.exp_()
-            curr.mul_(scale)
+                # Beer-Lambert + noise + accumulate — all on GPU
+                scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
+                curr = proj_curr_gpu.neg().exp_().mul_(scale)
 
-            if add_poisson_noise:
-                curr.clamp_(min=0.0)
-                curr = torch.poisson(curr)
+                if add_poisson_noise:
+                    curr.clamp_(min=0.0)
+                    curr = torch.poisson(curr)
 
-            if add_system_noise:
-                curr.add_(torch.randn_like(curr), alpha=shot_gain)
+                if add_system_noise:
+                    curr.add_(torch.randn_like(curr), alpha=shot_gain)
 
-            projection_buffer_gpu.add_(curr)
-            del curr
-            pc_sum += scale
+                projection_buffer_gpu.add_(curr)
+                pc_sum += scale
 
-            # Wait for prefetch to finish before swapping buffers
-            if prefetch_fut is not None:
-                prefetch_fut.result()
+                kev_iter.set_description(
+                    f"GPU keV {e}\t", refresh=True)
 
-            # Swap buffers — ref_buf_b (now filled) becomes the active buffer
-            ref_buf_a, ref_buf_b = ref_buf_b, ref_buf_a
+            del ref_image_gpu, proj_curr_gpu, voxel_idx_dhw, bg_mask_dhw
+            del lac_lut_gpu
+        else:
+            # ============ CPU FALLBACK PATH (cone-beam, non-CUDA) =============
+            # Double-buffered: prefetch thread fills next ref_image on CPU
+            # while ASTRA projects the current one.
+            self.logger.info(
+                "Using CPU fallback ASTRA path (geometry not parallel3d "
+                "or no CUDA)")
 
-            kev_iter.set_description(
-                f"Processing Energy Level, {e} keV:\t", refresh=True)
+            voxel_mat_idx_safe_cpu = voxel_mat_idx_safe_gpu.cpu().numpy()
+            bg_mask_cpu = bg_mask_gpu.cpu().numpy()
+            lac_lut_cpu = lac_lut_gpu.cpu().numpy()
+            del voxel_mat_idx_safe_gpu, bg_mask_gpu, lac_lut_gpu
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
-        prefetch_pool.shutdown(wait=False)
-        del ref_buf_a, ref_buf_b
-        del voxel_mat_idx_safe_cpu, bg_mask_cpu, lac_lut_cpu
+            vol_shape = voxel_mat_idx_safe_cpu.shape
+            ref_buf_a = np.empty(vol_shape, dtype=np.float32)
+            ref_buf_b = np.empty(vol_shape, dtype=np.float32)
+
+            def _prefetch(buf, k):
+                np.take(lac_lut_cpu[:, k], voxel_mat_idx_safe_cpu, out=buf)
+                buf[bg_mask_cpu] = 0.0
+
+            from concurrent.futures import ThreadPoolExecutor
+            prefetch_pool = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix='kev_prefetch')
+            _prefetch(ref_buf_a, 0)
+
+            for i, e in enumerate(kev_iter):
+                prefetch_fut = None
+                if i + 1 < len(kev_list):
+                    next_k = kev_list[i + 1] - self.keV_range[0]
+                    prefetch_fut = prefetch_pool.submit(
+                        _prefetch, ref_buf_b, next_k)
+
+                proj_np = self.scanner.run_fwd_projector(ref_buf_a)
+                curr = torch.as_tensor(proj_np, device=_gt_device)
+                del proj_np
+
+                scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
+                curr.neg_().exp_().mul_(scale)
+                if add_poisson_noise:
+                    curr.clamp_(min=0.0)
+                    curr = torch.poisson(curr)
+                if add_system_noise:
+                    curr.add_(torch.randn_like(curr), alpha=shot_gain)
+                projection_buffer_gpu.add_(curr)
+                del curr
+                pc_sum += scale
+
+                if prefetch_fut is not None:
+                    prefetch_fut.result()
+                ref_buf_a, ref_buf_b = ref_buf_b, ref_buf_a
+                kev_iter.set_description(
+                    f"CPU keV {e}\t", refresh=True)
+
+            prefetch_pool.shutdown(wait=False)
+            del ref_buf_a, ref_buf_b
+            del voxel_mat_idx_safe_cpu, bg_mask_cpu, lac_lut_cpu
 
         # Free ASTRA's cached GPU objects now that the energy sweep is done
         self.scanner.cleanup_astra_cache()

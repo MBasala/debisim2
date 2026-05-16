@@ -109,6 +109,8 @@ through the DebiSim GUI.
 import scipy.io as io
 
 from lib.reconstructor.freect import *
+import astra
+import astra.experimental  # noqa: F401 — needed for direct_FP3D GPU path
 import torch, torch.nn as nn
 import numpy as np
 from numpy import (zeros, ones, array, linspace, arange, concatenate, reshape,
@@ -745,6 +747,60 @@ class ScannerTemplate(object):
             astra.data3d.delete(self._astra_cache['proj_id'])
             astra.algorithm.delete(self._astra_cache['alg_id'])
             del self._astra_cache
+        if hasattr(self, '_astra_gpu_projector_id'):
+            astra.projector.delete(self._astra_gpu_projector_id)
+            del self._astra_gpu_projector_id
+    # -------------------------------------------------------------------------
+
+    def run_fwd_projector_gpu_direct(self, vol_tensor, proj_tensor):
+        """Forward project a torch CUDA tensor directly via ASTRA GPULink.
+
+        Eliminates the CPU↔GPU round-trip:
+          - vol_tensor:  torch CUDA float32 tensor, shape (D, H, W) contiguous
+          - proj_tensor: torch CUDA float32 tensor, shape (det_rows, n_views,
+                         det_cols) contiguous — written in place
+
+        Only parallel3d geometry is supported by this fast path; callers
+        must check ``self.proj_geom['type'] == 'parallel3d'`` first.
+
+        ASTRA uses CUDA pointer linking, so no data transfer occurs.
+        """
+        assert self.proj_geom['type'] == 'parallel3d', \
+            "GPU-direct path only supports parallel3d geometry"
+        assert vol_tensor.is_cuda and proj_tensor.is_cuda, \
+            "Both tensors must be CUDA"
+        assert vol_tensor.dtype == torch.float32 and \
+               proj_tensor.dtype == torch.float32, \
+            "ASTRA requires float32"
+        assert vol_tensor.is_contiguous() and proj_tensor.is_contiguous(), \
+            "Tensors must be contiguous for GPULink"
+
+        # Lazily create the cuda3d projector once per scanner geometry
+        if not hasattr(self, '_astra_gpu_projector_id') or \
+                self._astra_gpu_vol_shape != tuple(vol_tensor.shape):
+            if hasattr(self, '_astra_gpu_projector_id'):
+                astra.projector.delete(self._astra_gpu_projector_id)
+
+            # vol_tensor is (D, H, W); astra.create_vol_geom takes (Y, X, Z)
+            # but for our parallel beam the order matches H, W, D.
+            d, h, w = vol_tensor.shape
+            vol_geom = astra.create_vol_geom(h, w, d)
+            self._astra_gpu_projector_id = astra.create_projector(
+                'cuda3d', self.proj_geom, vol_geom)
+            self._astra_gpu_vol_shape = tuple(vol_tensor.shape)
+
+        # Wrap torch tensors as ASTRA GPULinks.  pitch = sizeof(float) * x
+        # for contiguous arrays where x is the fastest-changing dim.
+        vd, vh, vw = vol_tensor.shape
+        vol_link = astra.data3d.GPULink(
+            vol_tensor.data_ptr(), vw, vh, vd, 4 * vw)
+
+        pd, pv, pc = proj_tensor.shape  # (det_rows, n_views, det_cols)
+        proj_link = astra.data3d.GPULink(
+            proj_tensor.data_ptr(), pc, pv, pd, 4 * pc)
+
+        astra.experimental.direct_FP3D(
+            self._astra_gpu_projector_id, vol_link, proj_link)
     # -------------------------------------------------------------------------
 
     def _run_cone_equi_space_fp(self, vol_data, verbose=False):
