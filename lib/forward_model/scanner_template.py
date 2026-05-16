@@ -1124,18 +1124,20 @@ class ScannerTemplate(object):
 
         elif len(sino.shape)==3:
 
-            # Fast path: GPU-direct FBP via torch FFT + direct_BP3D.
-            # Eliminates the n_rows-iteration slice loop and its
-            # CPU<->GPU round-trip per slice.
-            if torch.cuda.is_available():
-                rec = self._run_fbp_parallel_beam_gpu_direct(sino)
-                self.logger.info(
-                    f"Result info:, {rec.max()}, {rec.min()}, {rec.shape}")
-                self.logger.info("Reconstruction took %.2fs"
-                                 % (time.time() - t0))
-                return rec
+            # NOTE: GPU-direct FBP via direct_BP3D + GPULink exists
+            # (_run_fbp_parallel_beam_gpu_direct) and is ~5x faster, but it
+            # uses ASTRA's parallel3d geometry which exposes a pre-existing
+            # vol_geom <-> proj_geom physical-extent mismatch (volume voxels
+            # default to unit=1.0 but detector spacing is det_spacing_x).
+            # That produces output with Y-axis mirrored and Z scaled
+            # relative to the legacy 2D per-slice path that downstream code
+            # (DICOM positions, ROI labels) was calibrated against.
+            #
+            # Until the underlying geometry is fixed end-to-end (forward
+            # projector, vol_geom extents, GT label alignment), we keep
+            # the legacy slice-loop active so existing user pipelines
+            # continue to produce expected output.
 
-            # Legacy CPU/per-slice fallback (preserved for non-CUDA hosts)
             # Input sino shape after run_fwd_model's moveaxis+flip:
             #   (det_cols, det_rows, n_views)
             # Reorder to (det_rows, n_views, det_cols) for filtering + ASTRA
