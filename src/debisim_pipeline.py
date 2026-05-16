@@ -1154,8 +1154,6 @@ class DEBISimPipeline(object):
         s_projn = torch.add(s_projn,  log(pc_sum))
         self.scatter_sino = s_projn.cpu().numpy()
 
-        self.scatter_recon = self.scanner.reconstruct_data(self.scatter_sino)
-
         spectra = [loadtxt(spec)[:self.maxkV,1]
                    for spec in self.xray_source_model['spectra']]
 
@@ -1164,12 +1162,25 @@ class DEBISimPipeline(object):
         cmin, cmax, offset = -1000, 3.2e4, 0
         scale = self.scanner.recon_params['img_scale']
 
+        # ---- Audit fix (mirrors BHC + decomposer scaling fixes) -----------
+        # The scatter and direct sinograms are in PHYSICAL line-integral
+        # units (cm⁻¹·cm after the vol_geom physical-extent fix in a4d97b9).
+        # The recon chain expects the sino in (1/self.scale)× scale so that
+        # FBP_CUDA recovers LAC in cm⁻¹ (matching mu_w['lac_1'] used in the
+        # HU formula below).  Previously the scatter path skipped this
+        # rescale and the recon came out in mm⁻¹ — HU would be off by 10×.
+        sino_correction = 1.0 / self.scale \
+            if abs(self.scale - 1.0) > 1e-6 else 1.0
+
+        self.scatter_recon = self.scanner.reconstruct_data(
+            self.scatter_sino * sino_correction)
         self.scatter_recon *= scale
         self.scatter_recon = \
             (self.scatter_recon - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
         self.scatter_recon = clip(self.scatter_recon, cmin, cmax).astype(STORAGE_DTYPE)
 
-        self.recon = self.scanner.reconstruct_data(self.sino)
+        self.recon = self.scanner.reconstruct_data(
+            self.sino * sino_correction)
         self.recon *= scale
         self.recon = (self.recon - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
         self.recon = clip(self.recon, cmin, cmax).astype(STORAGE_DTYPE)
@@ -1615,13 +1626,33 @@ class DEBISimPipeline(object):
 
             nrows = self.data1.shape[1]
 
-            # The decomposer's basis functions (Klein-Nishina, PE=e^-3)
-            # are defined for LAC in cm⁻¹.  Convert sinograms from
-            # self.scale units (mm⁻¹) to cm⁻¹ before decomposition.
+            # decomp_scale converts the decomposer's PHYSICAL output line
+            # integrals (cm⁻¹·cm) into the recon-chain scale that the
+            # FBP_CUDA path expects to recover Compton/PE in cm⁻¹.
+            # Same factor as sino_correction (= 1/self.scale = 10 for
+            # self.scale = 0.1).
             decomp_scale = 1.0 / self.scale if abs(self.scale - 1.0) > 1e-6 else 1.0
 
             solver = decomposer_args['cdm_solver']
             cdm_type = decomposer_args['cdm_type']
+
+            # ---- Audit fix (mirrors BHC scaling fix in ce652ed) ----------
+            # The decomposer's COMPTON_PE model fits A_p, A_c such that
+            # exp(-A_p·PE(E) - A_c·KN(E)) integrated over the spectrum
+            # matches the input -ln(I/I0).  Its model is calibrated for
+            # PHYSICAL line integrals (cm⁻¹·cm) — basis functions
+            # klein_nishina() and photoelectric() in lib/misc/ctlib.py are
+            # dimensionless.
+            #
+            # Previously we pre-multiplied the input by decomp_scale (=10),
+            # which pushed the model predictions into the saturated
+            # exp(-X) ≈ 0 regime for metal pixels (A_p·PE + A_c·KN > 30
+            # numerically) and produced garbage A_p, A_c fits there.
+            #
+            # Fix: feed physical sino to the decomposer; rescale the
+            # decomposer's PHYSICAL output by decomp_scale to put sino_c
+            # and sino_pe into the same units the recon chain expects
+            # (so FBP_CUDA recovers Compton/PE in cm⁻¹).
 
             if solver == 'gpu' and nrows > 1:
                 # ---- Batched GPU path: all rows in a single GpuFit call ------
@@ -1630,11 +1661,6 @@ class DEBISimPipeline(object):
                 # kernel launches + data transfers.
                 self.logger.info(
                     f"Decomposing {nrows} rows in a single batched GPU call")
-
-                # Stack all rows: shape (nbins, nrows, nangs) → flatten
-                # across rows so GpuFit sees nbins*nrows*nangs pixel pairs.
-                data1_scaled = self.data1 * decomp_scale
-                data2_scaled = self.data2 * decomp_scale
 
                 # Reshape to (nbins*nrows, nangs) per 2D slice convention,
                 # then let decompose_dect_sinograms flatten internally.
@@ -1647,21 +1673,23 @@ class DEBISimPipeline(object):
                 cdm_sim.n_sino_pxls = nbins * nrows * nangs
 
                 cdm_sim.init_val = decomposer_args['init_val']
+                # Input: physical line integral (not pre-scaled by 10).
                 sino_pe_flat, sino_c_flat = \
                     cdm_sim.decompose_dect_sinograms(
-                        data1_scaled.reshape(nbins * nrows, nangs),
-                        data2_scaled.reshape(nbins * nrows, nangs),
+                        self.data1.reshape(nbins * nrows, nangs),
+                        self.data2.reshape(nbins * nrows, nangs),
                         solver='gpu',
                         type=cdm_type
                     )
 
-                # Restore and reshape back to 3D
+                # Restore and reshape back to 3D, rescaling for the recon chain.
                 cdm_sim.sino_shape = orig_shape
                 cdm_sim.n_sino_pxls = orig_npxls
-                sino_pe = sino_pe_flat.reshape(nbins, nrows, nangs)
-                sino_c = sino_c_flat.reshape(nbins, nrows, nangs)
+                sino_pe = sino_pe_flat.reshape(
+                    nbins, nrows, nangs) * decomp_scale
+                sino_c = sino_c_flat.reshape(
+                    nbins, nrows, nangs) * decomp_scale
 
-                del data1_scaled, data2_scaled
                 torch.cuda.empty_cache()
             else:
                 # ---- Row-by-row fallback (CPU / vec solver) ------------------
@@ -1671,13 +1699,16 @@ class DEBISimPipeline(object):
                 for i in range(nrows):
                     self.logger.info("Row %d:" % i)
                     cdm_sim.init_val = decomposer_args['init_val']
-                    sino_pe[:, i, :], sino_c[:, i, :] = \
-                        cdm_sim.decompose_dect_sinograms(
-                            self.data1[:, i, :] * decomp_scale,
-                            self.data2[:, i, :] * decomp_scale,
-                            solver=solver,
-                            type=cdm_type
-                        )
+                    # Input: physical line integral (not pre-scaled by 10).
+                    pe_i, c_i = cdm_sim.decompose_dect_sinograms(
+                        self.data1[:, i, :],
+                        self.data2[:, i, :],
+                        solver=solver,
+                        type=cdm_type
+                    )
+                    # Rescale physical output to recon-chain scale.
+                    sino_pe[:, i, :] = pe_i * decomp_scale
+                    sino_c[:, i, :] = c_i * decomp_scale
 
             self.sino_c = sino_c.copy()
             self.sino_pe = sino_pe.copy()
