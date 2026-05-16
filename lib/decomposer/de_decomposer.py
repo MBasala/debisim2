@@ -246,7 +246,7 @@ class DEDecomposer(object):
         self.photoelectric = photoelectric
 
         self._load_spectra()
-        self.opt_specs = dict()
+        self.opt_specs = {}
 
         # Prepare Radon transpose, sparse row for efficient dot product
         if projector == 'cpu':
@@ -292,15 +292,15 @@ class DEDecomposer(object):
         self.R = R
         self.projector = projector
 
-        self.dect_specs = dict(
-            spctr_h_fname=spctr_h_fname,
-            spctr_l_fname=spctr_l_fname,
-            nangs=self.nangs,
-            nbins=self.nbins,
-            photon_count_low=self.photon_count_low,
-            photon_count_high=self.photon_count_high,
-            projector=projector,
-        )
+        self.dect_specs = {
+            'spctr_h_fname': spctr_h_fname,
+            'spctr_l_fname': spctr_l_fname,
+            'nangs': self.nangs,
+            'nbins': self.nbins,
+            'photon_count_low': self.photon_count_low,
+            'photon_count_high': self.photon_count_high,
+            'projector': projector,
+        }
         self.view_dect_specs()
 
         self.m1_cp = None
@@ -423,7 +423,7 @@ class DEDecomposer(object):
         ---------------------------------------------------------------------
         """
 
-        if cp == None:
+        if cp is None:
             cp = [(0.3, 10000), (0.6, 20000), (0.9, 30000)]
 
         # Draw a circle

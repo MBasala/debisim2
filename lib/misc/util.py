@@ -1,4 +1,10 @@
 import sys
+import io
+import subprocess
+import tarfile
+import time as _time
+import atexit as _atexit
+
 import numpy as np
 from numpy import *  # noqa: F401,F403 - intentional wildcard re-export
 from numpy.linalg import eigh
@@ -9,6 +15,8 @@ import scipy.misc as misc
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
+import psutil
+
 from astropy.io import fits as pyfits
 from pydicom import uid
 from skimage.measure import regionprops
@@ -18,7 +26,6 @@ from lib.__init__ import *
 from sys import stdout as stdout
 from lib.misc.multi_processor import *
 from PIL import Image
-import imageio
 
 
 class DicomCoordinateMapper:
@@ -298,9 +305,27 @@ def save_fits_data_async(file_path, out_image, compress=False):
         _io_futures[:] = surviving
 
 
+def submit_async_io(fn, *args, **kwargs):
+    """Submit an arbitrary callable to the I/O thread pool and track its
+    future so that flush_async_io() waits for it."""
+    fut = _get_io_pool().submit(fn, *args, **kwargs)
+    with _io_lock:
+        surviving = []
+        for f in _io_futures:
+            if f.done():
+                exc = f.exception()
+                if exc is not None:
+                    raise exc
+            else:
+                surviving.append(f)
+        surviving.append(fut)
+        _io_futures[:] = surviving
+    return fut
+
+
 def flush_async_io():
     """
-    Block until all pending async FITS writes have completed.
+    Block until all pending async I/O (FITS writes, GIFs, etc.) has completed.
     Call this before the pipeline exits or before reading back saved files.
     Raises the first exception encountered, if any.
     """
@@ -313,15 +338,232 @@ def flush_async_io():
 # -----------------------------------------------------------------------------
 
 
+# =============================================================================
+# Monolithic tar.gz archive — threaded writer with pigz for parallel gzip
+# =============================================================================
+
+_ARCHIVE_SENTINEL = None  # sentinel value to signal writer shutdown
+
+
+def _try_pigz(archive_path, threads):
+    """Start a pigz subprocess for parallel gzip.  Returns Popen or None."""
+    try:
+        cmd = ['pigz', '-c']
+        if threads > 0:
+            cmd += ['-p', str(threads)]
+        out_fh = open(archive_path, 'wb')
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=out_fh)
+        proc._out_fh = out_fh          # prevent GC closing file handle
+        return proc
+    except FileNotFoundError:
+        return None
+
+
+def _archive_writer_loop(q, archive_path, threads, written_event,
+                         written_count_lock, written_count_list):
+    """Writer thread entry point.
+
+    Uses a threading.Thread (not a subprocess) so that data passes
+    by reference — no pickling, no pipe buffer limits for multi-GB
+    FITS arrays.  The tarfile gzip (zlib) and pigz both release the
+    GIL during compression, so GPU work runs concurrently.
+
+    Parameters
+    ----------
+    q : queue.Queue
+        Thread-safe queue of (arcname, data_bytes) tuples.
+    archive_path : str
+        Output .tar.gz path.
+    threads : int
+        Compression threads for pigz (0 = auto).
+    written_event : threading.Event
+        Set after each item is written — used for RAM-pressure drain.
+    written_count_lock : threading.Lock
+        Protects written_count_list.
+    written_count_list : list[int]
+        Single-element list holding the write count (mutable container
+        shared between threads without multiprocessing overhead).
+    """
+    pigz_proc = None
+    tar = None
+    try:
+        pigz_proc = _try_pigz(archive_path, threads)
+        if pigz_proc is not None:
+            tar = tarfile.open(mode='w|', fileobj=pigz_proc.stdin)
+        else:
+            tar = tarfile.open(archive_path, 'w:gz', compresslevel=6)
+
+        while True:
+            item = q.get()
+            if item is _ARCHIVE_SENTINEL:
+                break
+            arcname, data = item
+            info = tarfile.TarInfo(name=arcname)
+            info.size = len(data)
+            info.mtime = int(_time.time())
+            tar.addfile(info, io.BytesIO(data))
+            # Update progress (thread-safe via lock)
+            with written_count_lock:
+                written_count_list[0] += 1
+            written_event.set()
+    except Exception:
+        pass  # partial archive is still valid tar
+    finally:
+        if tar is not None:
+            try:
+                tar.close()
+            except Exception:
+                pass
+        if pigz_proc is not None:
+            try:
+                pigz_proc.stdin.close()
+                pigz_proc.wait(timeout=30)
+            except Exception:
+                pass
+
+
+class MonolithicArchive:
+    """RAM-aware streaming tar.gz writer backed by a dedicated thread.
+
+    Data flow::
+
+        numpy array  →  BytesIO serialization (main thread)
+                     →  bytes reference on queue.Queue (zero-copy)
+                     →  writer thread (GIL released during zlib/pigz)
+                     →  tarfile.addfile  →  gzip  →  disk
+
+    Uses ``threading.Thread`` instead of ``multiprocessing.Process``
+    to avoid:
+      - Nested subprocess issues on Windows ``spawn`` context
+      - Multi-GB data pickling through pipe buffers
+      - CUDA context inheritance problems
+
+    Synchronization occurs **only** when:
+      1. Available RAM drops below threshold — main blocks until
+         the writer drains enough items.
+      2. ``close()`` is called at pipeline end.
+    """
+
+    def __init__(self, archive_path, compression_threads=0,
+                 ram_limit_fraction=0.5, logger=None):
+        self._archive_path = archive_path
+        self._ram_limit = ram_limit_fraction
+        self._logger = logger
+
+        # Progress tracking (thread-safe)
+        self._written_event = threading.Event()
+        self._written_lock = threading.Lock()
+        self._written_count = [0]   # mutable container shared with writer
+        self._enqueued_count = 0
+        self._enqueued_bytes = 0
+
+        # Standard thread queue — items pass by reference, no pickling
+        import queue
+        self._queue = queue.Queue()
+
+        # Writer thread — daemon so it dies if main crashes
+        self._writer = threading.Thread(
+            target=_archive_writer_loop,
+            args=(self._queue, archive_path, compression_threads,
+                  self._written_event, self._written_lock,
+                  self._written_count),
+            daemon=True,
+            name='archive-writer',
+        )
+        self._writer.start()
+
+    # ---- public API: serialize + enqueue --------------------------------
+
+    def add_fits(self, arcname, array, compress=False):
+        """Serialize a numpy array as FITS and enqueue."""
+        buf = io.BytesIO()
+        hdu = (pyfits.CompImageHDU(array, pyfits.Header()) if compress
+               else pyfits.PrimaryHDU(array, pyfits.Header()))
+        hdu.writeto(buf)
+        self._enqueue(arcname, buf.getvalue())
+
+    def add_npz(self, arcname, **arrays):
+        """Serialize numpy arrays as compressed .npz and enqueue."""
+        buf = io.BytesIO()
+        np.savez_compressed(buf, **arrays)
+        self._enqueue(arcname, buf.getvalue())
+
+    def add_dicom(self, arcname, dataset):
+        """Serialize a pydicom Dataset and enqueue."""
+        buf = io.BytesIO()
+        dataset.save_as(buf)
+        self._enqueue(arcname, buf.getvalue())
+
+    def add_pickle(self, arcname, obj):
+        """Pickle an object and enqueue."""
+        buf = io.BytesIO()
+        pickle.dump(obj, buf)
+        self._enqueue(arcname, buf.getvalue())
+
+    def add_raw(self, arcname, data_bytes):
+        """Enqueue pre-serialized bytes."""
+        self._enqueue(arcname, data_bytes)
+
+    # ---- internal: buffering + resource-aware flush ---------------------
+
+    def _enqueue(self, arcname, data_bytes):
+        """Put item on the writer queue. Block only if RAM is tight."""
+        self._queue.put((arcname, data_bytes))
+        self._enqueued_count += 1
+        self._enqueued_bytes += len(data_bytes)
+
+        # If RAM is getting tight, wait for writer to catch up
+        if self._ram_pressure():
+            self._wait_for_writer_drain()
+
+    def _ram_pressure(self):
+        """True if estimated in-flight bytes exceed available RAM limit."""
+        avail = psutil.virtual_memory().available
+        return self._enqueued_bytes > avail * self._ram_limit
+
+    def _wait_for_writer_drain(self):
+        """Block until the writer has processed enough items to relieve
+        RAM pressure.  This is the ONLY sync point during normal operation.
+        """
+        if self._logger:
+            self._logger.info(
+                f"MonolithicArchive: RAM pressure — waiting for writer "
+                f"(in-flight ~{self._enqueued_bytes / 1e9:.1f} GB)")
+        while self._ram_pressure():
+            self._written_event.wait(timeout=0.1)
+            self._written_event.clear()
+            with self._written_lock:
+                written = self._written_count[0]
+            if written > 0 and self._enqueued_count > 0:
+                avg_size = self._enqueued_bytes / self._enqueued_count
+                self._enqueued_bytes = builtins.max(
+                    0, avg_size * (self._enqueued_count - written))
+
+    # ---- lifecycle ------------------------------------------------------
+
+    def close(self):
+        """Signal writer to finish, wait for completion."""
+        self._queue.put(_ARCHIVE_SENTINEL)
+        self._writer.join(timeout=300)
+        if self._logger and os.path.exists(self._archive_path):
+            size_mb = os.path.getsize(self._archive_path) / 1e6
+            self._logger.info(
+                f"Archive written: {self._archive_path} ({size_mb:.1f} MB)")
+
+
+# =============================================================================
+
+
 def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
                       study_description='Simulated CT',
                       series_description='Recon', series_number=1,
                       pixel_spacing=(1.0, 1.0), slice_thickness=1.0,
-                      scan_metadata=None):
+                      scan_metadata=None, archive=None):
     """
     Save a 3D numpy array as a DICOM CT image series (one .dcm per slice).
 
-    :param output_dir:  directory to write .dcm files into
+    :param output_dir:  directory to write .dcm files into (also used as
+                        archive prefix when archive is set)
     :param volume_3d:   3D numpy array (H x W x D), values in HU
     :param patient_id:  DICOM PatientID
     :param study_description:  DICOM StudyDescription
@@ -334,6 +576,9 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         det_row_count, det_col_count, sens_spacing_x, sens_spacing_y,
         gantry_diameter, num_views, kVp, dosage, recon_algo,
         image_dims, fov, anode_angle
+    :param archive:    optional MonolithicArchive — when set, slices are
+                       serialized to bytes and dispatched via archive.add_raw()
+                       instead of writing to disk
     :returns: dict with keys study_uid, series_uid, frame_uid, sop_uids
     """
     import datetime
@@ -342,7 +587,8 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
     if scan_metadata is None:
         scan_metadata = {}
 
-    os.makedirs(output_dir, exist_ok=True)
+    if archive is None:
+        os.makedirs(output_dir, exist_ok=True)
 
     study_uid = uid.generate_uid()
     series_uid = uid.generate_uid()
@@ -382,7 +628,9 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         sop_uid = uid.generate_uid()
         sop_uids.append(sop_uid)
 
-        fname = os.path.join(output_dir, f'slice_{z:04d}.dcm')
+        slice_name = f'slice_{z:04d}.dcm'
+        fname = os.path.join(output_dir, slice_name) if archive is None \
+            else f'{output_dir}/{slice_name}'
         ds = FileDataset(fname, {}, preamble=b'\x00' * 128)
 
         # --- SOP / Study / Series UIDs ---
@@ -524,7 +772,12 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         ds.is_little_endian = True
         ds.is_implicit_VR = False
 
-        ds.save_as(fname)
+        if archive is not None:
+            buf = io.BytesIO()
+            ds.save_as(buf)
+            archive.add_raw(fname, buf.getvalue())
+        else:
+            ds.save_as(fname)
 
     return dict(study_uid=study_uid, series_uid=series_uid,
                 frame_uid=frame_uid, sop_uids=sop_uids)
@@ -547,17 +800,19 @@ _ROI_COLORS = {
 def create_rtstruct(output_path, roi_list, gt_label_volume,
                     ct_series_uids, pixel_spacing=(1.0, 1.0),
                     slice_thickness=1.0, patient_id='DEBISim',
-                    recon_volume=None):
+                    recon_volume=None, archive=None):
     """
     Create a DICOM RT-Structure Set file with ROI contours for threats.
 
-    :param output_path:      path for the output .dcm file
+    :param output_path:      path for the output .dcm file (or archive arcname)
     :param roi_list:         list of dicts with keys: label, name, category, material
     :param gt_label_volume:  3D numpy int array (H x W x D) with object labels
     :param ct_series_uids:   dict from save_dicom_series (study_uid, series_uid, frame_uid, sop_uids)
     :param pixel_spacing:    (row_spacing, col_spacing) in mm
     :param slice_thickness:  slice thickness in mm
     :param patient_id:       DICOM PatientID
+    :param archive:          optional MonolithicArchive — when set, output is
+                             dispatched via archive.add_raw() instead of disk
     """
     import datetime
     from pydicom.dataset import Dataset, FileDataset
@@ -701,14 +956,19 @@ def create_rtstruct(output_path, roi_list, gt_label_volume,
     ds.is_little_endian = True
     ds.is_implicit_VR = False
 
-    ds.save_as(output_path)
+    if archive is not None:
+        buf = io.BytesIO()
+        ds.save_as(buf)
+        archive.add_raw(output_path, buf.getvalue())
+    else:
+        ds.save_as(output_path)
 # -----------------------------------------------------------------------------
 
 
 def save_dicom_output(image_dir, recon_images, gt_label_volume,
                       sf_obj_list, pixel_spacing=(1.0, 1.0),
                       slice_thickness=1.0, scan_metadata=None,
-                      mu_handler=None):
+                      mu_handler=None, archive=None):
     """
     High-level function: save DICOM CT series + RT-Struct with ROIs for all
     objects (threats and non-threats alike).
@@ -721,14 +981,25 @@ def save_dicom_output(image_dir, recon_images, gt_label_volume,
     :param slice_thickness:  slice thickness in mm
     :param scan_metadata:    dict of scanner/source parameters for DICOM tags
     :param mu_handler:       MuDatabaseHandler instance for material property lookups
+    :param archive:          optional MonolithicArchive — when set, all DICOM
+                             output is serialized to bytes and dispatched via
+                             archive.add_raw() instead of writing to disk
     """
-    dicom_dir = os.path.join(image_dir, 'dicom')
-    os.makedirs(dicom_dir, exist_ok=True)
+    # When archiving, use forward-slash joins for arcnames (not os.path.join
+    # which produces backslashes on Windows).
+    if archive is not None:
+        _join = lambda *parts: '/'.join(parts)
+    else:
+        _join = os.path.join
+
+    dicom_dir = _join(image_dir, 'dicom')
+    if archive is None:
+        os.makedirs(dicom_dir, exist_ok=True)
 
     # Save each recon image as a DICOM CT series
     ct_uids = None
     for idx, (name, volume) in enumerate(recon_images.items(), start=1):
-        series_dir = os.path.join(dicom_dir, f'series_{name}')
+        series_dir = _join(dicom_dir, f'series_{name}')
         # Per-series metadata: override kVp from series name if it has kV
         series_meta = dict(scan_metadata) if scan_metadata else {}
         import re
@@ -739,7 +1010,7 @@ def save_dicom_output(image_dir, recon_images, gt_label_volume,
             series_dir, volume,
             series_description=name, series_number=idx,
             pixel_spacing=pixel_spacing, slice_thickness=slice_thickness,
-            scan_metadata=series_meta
+            scan_metadata=series_meta, archive=archive
         )
         if ct_uids is None:
             ct_uids = uids  # use first series as reference for RT-Struct
@@ -788,26 +1059,34 @@ def save_dicom_output(image_dir, recon_images, gt_label_volume,
         ))
 
     if len(roi_list) > 0:
-        rtstruct_path = os.path.join(dicom_dir, 'rtstruct.dcm')
+        rtstruct_path = _join(dicom_dir, 'rtstruct.dcm')
         # Use the first recon volume to clip contours to valid FBP slices
         ref_recon = next(iter(recon_images.values()), None)
         create_rtstruct(
             rtstruct_path, roi_list, gt_label_volume,
             ct_uids, pixel_spacing=pixel_spacing,
             slice_thickness=slice_thickness,
-            recon_volume=ref_recon,
+            recon_volume=ref_recon, archive=archive,
         )
 
         # Save a human-readable ROI manifest (CSV) alongside the DICOM files
         import csv
-        manifest_path = os.path.join(dicom_dir, 'roi_manifest.csv')
+        manifest_path = _join(dicom_dir, 'roi_manifest.csv')
         fieldnames = ['label', 'name', 'category', 'material', 'threat',
                       'mu', 'z_eff', 'density']
-        with open(manifest_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if archive is not None:
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=fieldnames)
             writer.writeheader()
             for roi in roi_list:
                 writer.writerow(roi)
+            archive.add_raw(manifest_path, buf.getvalue().encode('utf-8'))
+        else:
+            with open(manifest_path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                for roi in roi_list:
+                    writer.writerow(roi)
 # -----------------------------------------------------------------------------
 
 
@@ -842,26 +1121,4 @@ def create_pil_collage(images, fpath, layout=None, vlims=None):
 # -------------------------------------------------------------------------
 
 
-def create_gif(fname, input_vol, stride=1, scale=None):
-    """
-
-    :param fname:
-    :param input_vol:
-    :param stride:
-    :return:
-    """
-
-    input_vol = (input_vol-input_vol.min())/(input_vol.max()-input_vol.min())
-    input_vol = (input_vol*255).astype(uint8)
-
-    if scale is None:
-        imageio.mimsave(fname,
-                        [input_vol[:,:, z]
-                         for z in range(0,input_vol.shape[2], stride)],
-                        fps=5)
-    else:
-        imageio.mimsave(fname,
-                        [rescale(input_vol[:,:, z], scale=scale, preserve_range=True)
-                         for z in range(0,input_vol.shape[2], stride)],
-                        fps=5)
 

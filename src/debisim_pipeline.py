@@ -20,6 +20,7 @@ __status__    = "Prototype"
 import builtins
 import os
 import pickle
+import threading
 import time
 import warnings
 warnings.filterwarnings('ignore')
@@ -28,6 +29,7 @@ import numpy as np
 import scipy.ndimage as sptx
 import torch
 import torch.nn as nn
+from typing import List, Any, Optional
 import astra
 from numpy import (array, zeros, zeros_like, ones, arange, loadtxt,
                    log, exp, clip, unique, moveaxis, newaxis, float32, int16,
@@ -68,8 +70,8 @@ from lib.forward_model.scanner_template import ScannerTemplate
 from lib.forward_model.scatter_simulator import ScatterSimulator
 from lib.decomposer.cdm_decomposer import CDMDecomposer
 from lib.misc.util import (save_fits_data, save_fits_data_async, flush_async_io,
-                            read_fits_data, create_gif, get_logger,
-                            _get_io_pool)
+                            read_fits_data, get_logger,
+                            submit_async_io, MonolithicArchive)
 
 if torch.cuda.is_available():
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
@@ -195,7 +197,6 @@ default_file_locations = dict(
     image_dir='images/',
     sino_dir='projections/',
     gt_dir='ground_truth/',
-    gif_dir='gifs/',
     sino_file='sino_%i.fits.gz',
     img_file='recon_image_%i.fits.gz',
     gt_image='gt_label_image.fits.gz',
@@ -220,21 +221,23 @@ class DEBISimPipeline(object):
             mu_handler=None,
             debug=False,
             logfile=None,
-            compress_data=False
+            compress_data=False,
+            monolithic_output=False,
+            compression_threads=0
     ):
         """
         ------------------------------------------------------------------------
         Constructor for the DEBISimPipeline Class.
 
-        :param sim_path: The path to simulation directory - when the simulation 
-                         is complete this directory will be populated with 
-                         the subdirectories images/, sinograms/ and 
-                         ground_truth/ containing the res[ectively data.  
+        :param sim_path: The path to the simulation directory. When the simulation
+                         is complete, this directory will be populated with
+                         the subdirectories images/, sinograms/, and
+                         ground_truth/ containing the related data.
                          
         :param scanner_model: An instance of the ScannerTemplate where the 
                               scanner specifications are given.
         
-        :param xray_source_model: dictionary specifying the xray source 
+        :param xray_source_model: Dictionary specifying the X-ray source
                              specifications. See Module Description for details
 
         :param mu_handler:    A MuDatabaseHandler object (optional)
@@ -267,7 +270,7 @@ class DEBISimPipeline(object):
         os.makedirs(self.f_loc['simulation_dir'], exist_ok=True)
 
         # Assign absolute paths to all simulation files
-        for sim_file in ['image_dir', 'sino_dir', 'gt_dir', 'gif_dir']:
+        for sim_file in ['image_dir', 'sino_dir', 'gt_dir']:
             self.f_loc[sim_file] = os.path.join(self.f_loc['simulation_dir'],
                                                 self.f_loc[sim_file])
 
@@ -298,16 +301,6 @@ class DEBISimPipeline(object):
 
         self.mu.calculate_lac_hu_values('water', spectra)
 
-        if self.logfile is None:
-            self.logfile = os.path.join(self.f_loc['simulation_dir'],
-                                        'debisim_bag.log')
-            if not os.path.exists(self.logfile):
-                open(self.logfile, 'w+').close()
-
-        self.logger = get_logger('DEBISIM', self.logfile)
-
-        header = ['CT Specifications', '']
-
         # LAC unit scaling for the forward model energy loop.
         #
         # The mu database stores mass attenuation coefficients in cm²/g.
@@ -337,10 +330,36 @@ class DEBISimPipeline(object):
         self.apply_bhc = True   # water-based BHC (sinogram domain)
         self.apply_mar = False  # NMAR metal artifact reduction
 
+        # Monolithic archive mode — all outputs stream into a single
+        # .tar.gz via a subprocess with its own GIL.  Per-file FITS
+        # compression is disabled (the archive handles compression).
+        self.monolithic_output = monolithic_output
+        self.archive = None
+        if monolithic_output:
+            self.compress_data = False  # archive compresses everything
+            archive_path = self.f_loc['simulation_dir'].rstrip('/\\') + '.tar.gz'
+            self.archive = MonolithicArchive(
+                archive_path,
+                compression_threads=compression_threads,
+                ram_limit_fraction=0.5,
+            )
+
+        if self.logfile is None:
+            self.logfile = os.path.join(self.f_loc['simulation_dir'],
+                                        'debisim_bag.log')
+            if not os.path.exists(self.logfile):
+                open(self.logfile, 'w+').close()
+
+        self.logger = get_logger('DEBISIM', self.logfile)
+
+        if self.archive is not None:
+            self.archive._logger = self.logger
+
+        header = ['CT Specifications', '']
         print_table = []
 
         print_table.append(['Initialization Time',
-                            time.strftime('%m-%d-%Y %H:%M:%S', 
+                            time.strftime('%m-%d-%Y %H:%M:%S',
                                           time.localtime())])
         print_table.append(['Simulation Directory',
                             self.f_loc['simulation_dir']])
@@ -359,7 +378,7 @@ class DEBISimPipeline(object):
     def create_random_simulation_instance(self,
                                           baggage_creator_args,
                                           prior_image=None,
-                                          prior_list=[],
+                                          prior_list=None,
                                           save_images=['gt'],
                                           slicewise=False,
                                           template=2
@@ -381,6 +400,8 @@ class DEBISimPipeline(object):
         """
 
         # run BaggageCreator3D with the input creator args ---------------------
+        if prior_list is None:
+            prior_list = []
         bag_vol_shape = list(self.image_shape_3d)
         # bag_vol_shape[2] = max(bag_vol_shape[2], 350)
 
@@ -410,7 +431,7 @@ class DEBISimPipeline(object):
                                                  debug=self.debug
                                          )
 
-        # obtain Object3D list — either calibration phantom or random bag
+        # get Object3D list — either calibration phantom or random bag
         _bag_args = dict(baggage_creator_args)
         prevent_overlap = _bag_args.pop('prevent_overlap', False)
         phantom_mode = _bag_args.pop('phantom_mode', False)
@@ -461,7 +482,7 @@ class DEBISimPipeline(object):
 
         self.sf_obj_list = sf_obj_list
 
-        # create compton_image - this is used for forward modelling
+        # create compton_image - this is used for forward modeling
         self.compton_image_3d = torch.zeros_like(self.gt_image_3d,
                                                  dtype=T_FLOAT)
 
@@ -487,8 +508,8 @@ class DEBISimPipeline(object):
 
         self.mu.calculate_lac_hu_values('water', spectra)
 
-        sim_obj_dict = dict()
-        material_curve = dict()
+        sim_obj_dict = {}
+        material_curve = {}
 
         # iterating through each object
         for k, sf_obj in enumerate(sf_obj_list):
@@ -539,9 +560,7 @@ class DEBISimPipeline(object):
         # ---------------------------------------------------------------------
 
         # save the dictionary of objects as metadata
-        with open(self.f_loc['sl_metadata'], 'wb') as f:
-            pickle.dump(sim_obj_dict, f)
-            f.close()
+        self._save_pickle(self.f_loc['sl_metadata'], sim_obj_dict)
 
         self.logger.info(f"Metadata generated and saved "
                          f"at {self.f_loc['sl_metadata']}")
@@ -639,8 +658,8 @@ class DEBISimPipeline(object):
         spectra = [loadtxt(spec)[:self.maxkV,1]
                    for spec in self.xray_source_model['spectra']]
 
-        sim_obj_dict = dict()
-        material_curve = dict()
+        sim_obj_dict = {}
+        material_curve = {}
 
         # TODO: check load sim with liquid objects
         for k, sf_obj in enumerate(sf_obj_list):
@@ -668,9 +687,7 @@ class DEBISimPipeline(object):
 
             sim_obj_dict['%i' % sf_obj['label']] = sf_obj.copy()
 
-        with open(self.f_loc['sl_metadata'], 'wb') as f:
-            pickle.dump(sim_obj_dict, f)
-            f.close()
+        self._save_pickle(self.f_loc['sl_metadata'], sim_obj_dict)
 
         self.logger.info("\nMetadata generated")
         # ----------------------------------------------------------------------
@@ -794,7 +811,15 @@ class DEBISimPipeline(object):
         # passed to ASTRA (which runs its own GPU kernels).  Keeping this on
         # CPU means torch doesn't hog VRAM while ASTRA needs it.
         mat_indices = {mat: idx for idx, mat in enumerate(material_list)}
+
+        # max_label must cover ALL labels including liquid labels that may
+        # exceed gt_image_3d.max() (e.g. when liquid fill partially failed).
         max_label = int(self.gt_image_3d.max().item()) + 1
+        for sf_obj in self.sf_obj_list:
+            max_label = builtins.max(max_label, sf_obj['label'] + 1)
+            if sf_obj.get('lqd_flag') and sf_obj.get('lqd_param'):
+                max_label = builtins.max(
+                    max_label, sf_obj['lqd_param']['lqd_label'] + 1)
 
         _label_to_mat_idx = np.full(max_label, -1, dtype=NP_INT)
         for sf_obj in self.sf_obj_list:
@@ -885,24 +910,40 @@ class DEBISimPipeline(object):
                                             device=_gt_device)
 
         # ---- Per-keV LUT gather + ASTRA projection ----------------------------
+        # Double-buffered pipeline: a prefetch thread prepares the next
+        # ref_image on CPU while ASTRA projects the current one on GPU.
+        # ASTRA's C extension releases the GIL during CUDA kernel execution,
+        # so the CPU LUT gather runs truly concurrently with GPU work.
         vol_shape = voxel_mat_idx_safe_cpu.shape
-        # ASTRA requires float32 at the boundary — cast here if NP_FLOAT
-        # is a higher precision type.
-        ref_image_cpu = np.empty(vol_shape, dtype=np.float32)  # ASTRA: fixed f32
+
+        # Two buffers — one for ASTRA, one being filled by the prefetch thread
+        ref_buf_a = np.empty(vol_shape, dtype=np.float32)
+        ref_buf_b = np.empty(vol_shape, dtype=np.float32)
 
         kev_list = list(self.keV_range[:curr_spectrum.size])
         kev_iter = tqdm(kev_list)
 
-        for e in kev_iter:
-            k = e - self.keV_range[0]
+        # Prefetch helper: fills a buffer with the LAC image for keV index k
+        def _prefetch(buf, k):
+            np.take(lac_lut_cpu[:, k], voxel_mat_idx_safe_cpu, out=buf)
+            buf[bg_mask_cpu] = 0.0
 
-            # CPU LUT gather: map each voxel to its LAC at this energy level
-            np.take(lac_lut_cpu[:, k], voxel_mat_idx_safe_cpu,
-                    out=ref_image_cpu)
-            ref_image_cpu[bg_mask_cpu] = 0.0
+        # Seed the first buffer synchronously
+        _prefetch(ref_buf_a, 0)
 
-            # --- ASTRA GPU — forward projection ----
-            proj_np = self.scanner.run_fwd_projector(ref_image_cpu)
+        for i, e in enumerate(kev_iter):
+            # ref_buf_a holds the ready image for this keV step.
+            # Start prefetching the NEXT keV into ref_buf_b while ASTRA runs.
+            prefetch_thread = None
+            if i + 1 < len(kev_list):
+                next_k = kev_list[i + 1] - self.keV_range[0]
+                prefetch_thread = threading.Thread(
+                    target=_prefetch, args=(ref_buf_b, next_k),
+                    daemon=True, name='kev-prefetch')
+                prefetch_thread.start()
+
+            # --- ASTRA GPU — forward projection (GIL released in C code) ------
+            proj_np = self.scanner.run_fwd_projector(ref_buf_a)
 
             # --- torch GPU — Beer-Lambert + noise + accumulate ----------------
             curr = torch.as_tensor(proj_np, device=_gt_device)
@@ -924,10 +965,17 @@ class DEBISimPipeline(object):
             del curr
             pc_sum += scale
 
+            # Wait for prefetch to finish before swapping buffers
+            if prefetch_thread is not None:
+                prefetch_thread.join()
+
+            # Swap buffers — ref_buf_b (now filled) becomes the active buffer
+            ref_buf_a, ref_buf_b = ref_buf_b, ref_buf_a
+
             kev_iter.set_description(
                 f"Processing Energy Level, {e} keV:\t", refresh=True)
 
-        del ref_image_cpu
+        del ref_buf_a, ref_buf_b
         del voxel_mat_idx_safe_cpu, bg_mask_cpu, lac_lut_cpu
 
         # Free ASTRA's cached GPU objects now that the energy sweep is done
@@ -957,11 +1005,9 @@ class DEBISimPipeline(object):
 
         self.logger.info("Sinogram Created ...")
 
-        save_fits_data_async(self.f_loc['sino_file']%spectrum,
-                       projection_buffer,
-                       self.compress_data)
+        self._save_output(self.f_loc['sino_file']%spectrum,
+                       projection_buffer)
 
-        self.logger.info("Sinogram saved as %s"%(self.f_loc['sino_file']%spectrum))
         self.logger.info(f"Time Taken: {time.time() - t0}")
 
         return projection_buffer
@@ -1010,7 +1056,9 @@ class DEBISimPipeline(object):
             )
         else:
             flush_async_io()
-            sino_buf = read_fits_data(self.f_loc['sino_file']%spectrum, 0)
+            _field = 1 if getattr(self, 'compress_data', False) else 0
+            sino_buf = read_fits_data(
+                self.f_loc['sino_file'] % spectrum, _field)
 
         self.sino = sino_buf[slice_no, :, :].copy()
 
@@ -1123,6 +1171,54 @@ class DEBISimPipeline(object):
         
         elif mode=='manual':
             self.create_simulation_from_sl_file(sf_file, **sim_args)
+    # --------------------------------------------------------------------------
+
+    def _to_arcname(self, abs_path):
+        """Convert an absolute path to a forward-slash archive-relative path."""
+        abs_norm = os.path.normpath(abs_path).replace(os.sep, '/')
+        sim_norm = os.path.normpath(
+            self.f_loc['simulation_dir']).replace(os.sep, '/').rstrip('/')
+        if abs_norm.startswith(sim_norm + '/'):
+            return abs_norm[len(sim_norm) + 1:]
+        return abs_norm.split('/')[-1]
+
+    def _save_output(self, path, array, compress=None):
+        """Save an array — routes to archive (monolithic) or async FITS.
+
+        :param path:      absolute path or relative to simulation_dir
+        :param array:     numpy array to save
+        :param compress:  override compress flag; defaults to self.compress_data
+        """
+        if compress is None:
+            compress = self.compress_data
+        if self.monolithic_output and self.archive is not None:
+            arcname = self._to_arcname(path)
+            self.archive.add_fits(arcname, array, compress)
+            self.logger.info(f"Archived: {arcname}")
+        else:
+            save_fits_data_async(path, array, compress)
+            self.logger.info(f"Saving: {path}")
+
+    def _save_npz(self, path, *args, **arrays):
+        """Save numpy arrays as .npz — routes to archive or disk."""
+        if self.monolithic_output and self.archive is not None:
+            kw = dict(arrays)
+            for i, a in enumerate(args):
+                kw[f'arr_{i}'] = a
+            arcname = self._to_arcname(path)
+            self.archive.add_npz(arcname, **kw)
+            self.logger.info(f"Archived: {arcname}")
+        else:
+            savez_compressed(path, *args, **arrays)
+            self.logger.info(f"Saving: {path}")
+
+    def _save_pickle(self, path, obj):
+        """Save a pickle — routes to archive or disk."""
+        if self.monolithic_output and self.archive is not None:
+            self.archive.add_pickle(self._to_arcname(path), obj)
+        else:
+            with open(path, 'wb') as f:
+                pickle.dump(obj, f)
     # --------------------------------------------------------------------------
 
     def run_fwd_model(self,
@@ -1405,9 +1501,8 @@ class DEBISimPipeline(object):
 
             self.f_loc['sino_file'] = os.path.join(self.f_loc['sino_dir'],
                                                     'sino_%i.fits.gz')
-            save_fits_data_async(self.f_loc['sino_file'] % 1,
-                           self.data,
-                           self.compress_data)
+            self._save_output(self.f_loc['sino_file'] % 1,
+                           self.data)
 
             self.data = moveaxis(self.data, -1, 0)
             self.data = self.data[:, :, ::-1]
@@ -1426,12 +1521,12 @@ class DEBISimPipeline(object):
                 self.data2[:, s::n_seqs, :] = raw_sinos[1][:, s::n_seqs, :]
 
             self.f_loc['sino_file'] = 'sino_%i.fits.gz'
-            save_fits_data_async(self.f_loc['sino_file'] % 1, self.data1, self.compress_data)
+            self._save_output(self.f_loc['sino_file'] % 1, self.data1)
 
             self.data1 = moveaxis(self.data1, -1, 0)
             self.data1 = self.data1[:, :, ::-1]
 
-            save_fits_data_async(self.f_loc['sino_file'] % 2, self.data2, self.compress_data)
+            self._save_output(self.f_loc['sino_file'] % 2, self.data2)
 
             self.data2 = moveaxis(self.data2, -1, 0)
             self.data2 = self.data2[:, :, ::-1]
@@ -1548,7 +1643,7 @@ class DEBISimPipeline(object):
                     bhc_correctors.append(bhc)
                     self.logger.info(
                         f"BHC LUT built: E_eff={bhc.e_eff:.1f} keV, "
-                        f"mu_mono={bhc.mu_mono:.4f} cm⁻¹")
+                        f"mu_mono={bhc.mu_mono:.4f} cm^-1")
             except Exception as e:
                 self.logger.warning(f"BHC initialization failed: {e}")
                 bhc_correctors = []
@@ -1617,9 +1712,8 @@ class DEBISimPipeline(object):
                     out_fname = os.path.join(self.f_loc['sino_dir'],
                                              fname % (img_suffixes[0]))
 
-                self.logger.info(f"Saving results to: {out_fname}")
                 self.sino_c = moveaxis(self.sino_c, -1, 0)
-                savez_compressed(out_fname, self.sino_c)
+                self._save_npz(out_fname, self.sino_c)
             del self.sino_c
 
             if self.save_de_sino:
@@ -1630,9 +1724,8 @@ class DEBISimPipeline(object):
                     out_fname = os.path.join(self.f_loc['sino_dir'],
                                              fname % (img_suffixes[1]))
 
-                self.logger.info(f"Saving results to: {out_fname}")
                 self.sino_pe = moveaxis(self.sino_pe, -1, 0)
-                savez_compressed(out_fname, self.sino_pe)
+                self._save_npz(out_fname, self.sino_pe)
             del self.sino_pe
 
         scale = self.scanner.recon_params['img_scale']
@@ -1669,9 +1762,9 @@ class DEBISimPipeline(object):
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'] % 1)
-                self.logger.info("Saving results to: "+out_fname)
 
-                save_fits_data_async(out_fname, image_1, self.compress_data)
+
+                self._save_output(out_fname, image_1)
 
                 image_2 *= scale
                 image_2 = (image_2 - mu_w['lac_2']) / mu_w['lac_2'] * 1000 + offset
@@ -1680,24 +1773,11 @@ class DEBISimPipeline(object):
                 # Save reconstructed images
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'] % 2)
-                self.logger.info("Saving results to: "+out_fname)
-                save_fits_data_async(out_fname, image_2, self.compress_data)
+
+                self._save_output(out_fname, image_2)
 
                 # Cache in memory so save_dicom_output() doesn't re-read from disk
                 self._recon_images_cache = [image_1, image_2]
-
-                # GIF encoding is pure I/O — dispatch to background thread
-                _gif_pool = _get_io_pool()
-                _gif_pool.submit(create_gif,
-                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
-                    self.gt_image_3d.cpu().numpy(), stride=5)
-                _gif_pool.submit(create_gif,
-                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
-                    np.clip(image_1+1000, 0, 3500), stride=2)
-                _gif_pool.submit(create_gif,
-                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%2),
-                    np.clip(image_2+1000, 0, 3500), stride=2)
-                self.logger.info("Dispatched GIF creation to background")
 
             elif self.xray_source_model['num_spectra'] == 1:
                 image_1 *= scale
@@ -1711,22 +1791,11 @@ class DEBISimPipeline(object):
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file']%1)
-                self.logger.info("Saving results to: "+out_fname)
-                save_fits_data_async(out_fname, image_1, self.compress_data)
+
+                self._save_output(out_fname, image_1)
 
                 # Cache in memory so save_dicom_output() doesn't re-read from disk
                 self._recon_images_cache = [image_1]
-
-                # GIF encoding is pure I/O — dispatch to background thread
-                _gif_pool = _get_io_pool()
-                _gif_pool.submit(create_gif,
-                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
-                    self.gt_image_3d.cpu().numpy(), stride=5)
-                _gif_pool.submit(create_gif,
-                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
-                    np.clip(image_1+1000, 0, 3500), stride=2)
-
-                self.logger.info("Dispatched GIF creation to background")
 
             if self.DECOMPOSER_FLAG:
                 if self.scanner.machine_geometry['scanner_name'] in (
@@ -1773,18 +1842,18 @@ class DEBISimPipeline(object):
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % img_suffixes[0])
-                self.logger.info("Saving results to: "+out_fname)
-                save_fits_data_async(out_fname, image_c, self.compress_data)
+
+                self._save_output(out_fname, image_c)
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % img_suffixes[1])
-                self.logger.info("Saving results to: "+out_fname)
-                save_fits_data_async(out_fname, image_pe, self.compress_data)
+
+                self._save_output(out_fname, image_pe)
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % 'z')
-                self.logger.info("Saving results to: "+out_fname)
-                save_fits_data_async(out_fname, image_z, self.compress_data)
+
+                self._save_output(out_fname, image_z)
 
                 del image_c, image_pe, image_z, image_1, image_2
 
@@ -1796,8 +1865,8 @@ class DEBISimPipeline(object):
 
                     out_fname = os.path.join(self.f_loc['image_dir'],
                                              'recon_image_%s.fits.gz' % 'rho')
-                    self.logger.info("Saving results to: "+out_fname)
-                    save_fits_data_async(out_fname, image_rho, self.compress_data)
+    
+                    self._save_output(out_fname, image_rho)
 
             # Wait for all async FITS writes to complete before exiting
             flush_async_io()
@@ -1892,8 +1961,13 @@ class DEBISimPipeline(object):
         pixel_sz = mg.get('det_spacing_y', 1.0)
         slice_sz = mg.get('det_spacing_x', pixel_sz)
 
+        archive = self.archive if self.monolithic_output else None
+        # When archiving, pass a relative prefix so all DICOM arcnames
+        # are relative paths with forward slashes (e.g. images/dicom/...).
+        dicom_image_dir = (self._to_arcname(self.f_loc['image_dir'])
+                           if archive else self.f_loc['image_dir'])
         _save_dicom(
-            image_dir=self.f_loc['image_dir'],
+            image_dir=dicom_image_dir,
             recon_images=recon_images,
             gt_label_volume=gt_label,
             sf_obj_list=self.sf_obj_list,
@@ -1901,9 +1975,14 @@ class DEBISimPipeline(object):
             slice_thickness=float(slice_sz),
             scan_metadata=scan_metadata,
             mu_handler=self.mu,
+            archive=archive,
         )
-        self.logger.info("DICOM output with threat ROIs saved to %s" %
-                         os.path.join(self.f_loc['image_dir'], 'dicom'))
+
+        if archive is not None:
+            self.logger.info("Archived DICOM output")
+        else:
+            dicom_dir = os.path.join(self.f_loc['image_dir'], 'dicom')
+            self.logger.info("DICOM output saved to %s" % dicom_dir)
     # --------------------------------------------------------------------------
 
     def save_dect_ground_truth_images(self, images=['gt']):
@@ -1918,19 +1997,19 @@ class DEBISimPipeline(object):
         """
 
         if 'gt' in images:
-            save_fits_data_async(self.f_loc['gt_image'],
-                           self.gt_image_3d.cpu().numpy().astype(STORAGE_DTYPE), self.compress_data)
+            self._save_output(self.f_loc['gt_image'],
+                           self.gt_image_3d.cpu().numpy().astype(STORAGE_DTYPE))
 
-            self.logger.info("GT image saved as %s"%self.f_loc['gt_image'])
+
 
         if 'compton' in images:
             compton_image_file = os.path.join(self.f_loc['gt_dir'],
                                               'gt_compton_image.fits.gz')
 
-            save_fits_data_async(compton_image_file,
-                           self.compton_image_3d.cpu().numpy(), self.compress_data)
+            self._save_output(compton_image_file,
+                           self.compton_image_3d.cpu().numpy())
 
-            self.logger.info("Compton image saved as %s"%compton_image_file)
+
 
         if 'pe' in images:
             pe_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -1951,9 +2030,9 @@ class DEBISimPipeline(object):
                                                                                 'pe')]),
                                                  pe_image_3d)
 
-            save_fits_data_async(pe_image_file, pe_image_3d.cpu().numpy(), self.compress_data)
+            self._save_output(pe_image_file, pe_image_3d.cpu().numpy())
             del pe_image_3d
-            self.logger.info("PE image saved as %s"%pe_image_file)
+
 
         if 'zeff' in images:
             zeff_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -1974,9 +2053,9 @@ class DEBISimPipeline(object):
                                                                                 'z')]),
                                                  zeff_image_3d)
 
-            save_fits_data_async(zeff_image_file, zeff_image_3d.cpu().numpy(), self.compress_data)
+            self._save_output(zeff_image_file, zeff_image_3d.cpu().numpy())
             del zeff_image_3d
-            self.logger.info("Zeff image saved as %s"%zeff_image_file)
+
 
         if 'lac' in images:
             lac_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -1996,9 +2075,9 @@ class DEBISimPipeline(object):
                                                                                 'lac')]),
                                                  lac_1_image_3d)
 
-            save_fits_data_async(lac_image_file, lac_image_3d.cpu().numpy(), self.compress_data)
+            self._save_output(lac_image_file, lac_image_3d.cpu().numpy())
             del lac_image_3d
-            self.logger.info("LAC image saved as %s"%lac_image_file)
+
 
         if 'lac_1' in images:
             lac_1_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -2019,9 +2098,9 @@ class DEBISimPipeline(object):
                                                                                 'lac_1')]),
                                                  lac_1_image_3d)
 
-            save_fits_data_async(lac_1_image_file, lac_1_image_3d.cpu().numpy(), self.compress_data)
+            self._save_output(lac_1_image_file, lac_1_image_3d.cpu().numpy())
             del lac_1_image_3d
-            self.logger.info("LAC 1 image saved as %s"%lac_1_image_file)
+
 
         if 'lac_2' in images:
             lac_2_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -2042,9 +2121,9 @@ class DEBISimPipeline(object):
                                                                                 'lac_2')]),
                                                  lac_2_image_3d)
 
-            save_fits_data_async(lac_2_image_file, lac_2_image_3d.cpu().numpy(), self.compress_data)
+            self._save_output(lac_2_image_file, lac_2_image_3d.cpu().numpy())
             del lac_2_image_3d
-            self.logger.info("LAC 2 image saved as %s"%lac_2_image_file)
+
 
         torch.cuda.empty_cache()   # single cleanup after all GT images saved
     # --------------------------------------------------------------------------
