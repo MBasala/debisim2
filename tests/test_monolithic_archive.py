@@ -1,6 +1,6 @@
 """
-Tests for MonolithicArchive — RAM-aware streaming tar.gz writer backed
-by a dedicated subprocess.
+Tests for MonolithicArchive — RAM-aware streaming archive writer with
+parallel serialization, auto-selecting zstd/pigz/gzip.
 
 Verifies:
   - FITS, NPZ, pickle data survive the archive round-trip
@@ -22,6 +22,42 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from lib.misc.util import MonolithicArchive
+
+
+# ---------------------------------------------------------------------------
+# Helpers — open the archive the writer actually produced, regardless of
+# which compressor was chosen (zstd / pigz / gzip).
+# ---------------------------------------------------------------------------
+
+def _open_archive(path):
+    """Return a tarfile open in read mode, handling zstd, gzip, or plain tar."""
+    if path.endswith('.zst'):
+        import zstandard
+        fh = open(path, 'rb')
+        dctx = zstandard.ZstdDecompressor()
+        stream = dctx.stream_reader(fh)
+        # Wrap in tarfile via a non-seekable file-like
+        return tarfile.open(fileobj=stream, mode='r|')
+    elif path.endswith('.gz'):
+        return tarfile.open(path, mode='r:gz')
+    else:
+        return tarfile.open(path, mode='r')
+
+
+def _read_member(path, arcname):
+    """Read a single named member's bytes from an archive of any format."""
+    with _open_archive(path) as tar:
+        for member in tar:
+            if member.name == arcname:
+                f = tar.extractfile(member)
+                return f.read()
+    raise KeyError(arcname)
+
+
+def _list_members(path):
+    """List all member names in an archive of any format."""
+    with _open_archive(path) as tar:
+        return [m.name for m in tar]
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +84,9 @@ class TestArchiveLifecycle:
         ar = MonolithicArchive(archive_path)
         ar.add_fits('test.fits', small_volume)
         ar.close()
-        assert os.path.exists(archive_path)
-        assert os.path.getsize(archive_path) > 0
+        # Writer may pick zstd / pigz / gzip — use the actual path
+        assert os.path.exists(ar.path)
+        assert os.path.getsize(ar.path) > 0
 
     def test_close_is_idempotent(self, archive_path):
         ar = MonolithicArchive(archive_path)
@@ -60,9 +97,8 @@ class TestArchiveLifecycle:
     def test_empty_archive_is_valid(self, archive_path):
         ar = MonolithicArchive(archive_path)
         ar.close()
-        assert os.path.exists(archive_path)
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            assert len(tar.getnames()) == 0
+        assert os.path.exists(ar.path)
+        assert _list_members(ar.path) == []
 
     def test_writer_process_terminates(self, archive_path):
         ar = MonolithicArchive(archive_path)
@@ -82,16 +118,11 @@ class TestFitsRoundTrip:
         ar.add_fits('data/test.fits', small_volume)
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            names = tar.getnames()
-            assert 'data/test.fits' in names
-
-            member = tar.getmember('data/test.fits')
-            f = tar.extractfile(member)
-            from astropy.io import fits
-            hdul = fits.open(io.BytesIO(f.read()))
-            loaded = hdul[0].data
-            np.testing.assert_allclose(loaded, small_volume, rtol=1e-5)
+        assert 'data/test.fits' in _list_members(ar.path)
+        from astropy.io import fits
+        raw = _read_member(ar.path, 'data/test.fits')
+        loaded = fits.open(io.BytesIO(raw))[0].data
+        np.testing.assert_allclose(loaded, small_volume, rtol=1e-5)
 
     def test_multiple_fits_files(self, archive_path):
         ar = MonolithicArchive(archive_path)
@@ -103,26 +134,25 @@ class TestFitsRoundTrip:
             vols[name] = v
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            assert len(tar.getnames()) == 5
-            for name, expected in vols.items():
-                f = tar.extractfile(tar.getmember(name))
-                from astropy.io import fits
-                loaded = fits.open(io.BytesIO(f.read()))[0].data
-                np.testing.assert_allclose(loaded, expected, rtol=1e-5)
+        names = _list_members(ar.path)
+        assert len(names) == 5
+        from astropy.io import fits
+        for name, expected in vols.items():
+            raw = _read_member(ar.path, name)
+            loaded = fits.open(io.BytesIO(raw))[0].data
+            np.testing.assert_allclose(loaded, expected, rtol=1e-5)
 
     def test_compressed_fits(self, archive_path, small_volume):
-        """CompImageHDU (compress=True) should also survive."""
+        """compress=True is honored (CompImageHDU instead of PrimaryHDU)."""
         ar = MonolithicArchive(archive_path)
         ar.add_fits('compressed.fits', small_volume, compress=True)
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            f = tar.extractfile(tar.getmember('compressed.fits'))
-            from astropy.io import fits
-            hdul = fits.open(io.BytesIO(f.read()))
-            loaded = hdul[1].data  # CompImageHDU is at index 1
-            np.testing.assert_allclose(loaded, small_volume, rtol=1e-5)
+        from astropy.io import fits
+        raw = _read_member(ar.path, 'compressed.fits')
+        hdul = fits.open(io.BytesIO(raw))
+        loaded = hdul[1].data  # CompImageHDU is at index 1
+        np.testing.assert_allclose(loaded, small_volume, rtol=1e-5)
 
 
 # ===========================================================================
@@ -139,11 +169,10 @@ class TestNpzRoundTrip:
         ar.add_npz('projections/sino_c.npz', compton=arr1, pe=arr2)
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            f = tar.extractfile(tar.getmember('projections/sino_c.npz'))
-            data = np.load(io.BytesIO(f.read()))
-            np.testing.assert_allclose(data['compton'], arr1, rtol=1e-5)
-            np.testing.assert_array_equal(data['pe'], arr2)
+        raw = _read_member(ar.path, 'projections/sino_c.npz')
+        data = np.load(io.BytesIO(raw))
+        np.testing.assert_allclose(data['compton'], arr1, rtol=1e-5)
+        np.testing.assert_array_equal(data['pe'], arr2)
 
 
 # ===========================================================================
@@ -158,10 +187,9 @@ class TestPickleRoundTrip:
         ar.add_pickle('metadata.pyc', obj)
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            f = tar.extractfile(tar.getmember('metadata.pyc'))
-            loaded = pickle.loads(f.read())
-            assert loaded == obj
+        raw = _read_member(ar.path, 'metadata.pyc')
+        loaded = pickle.loads(raw)
+        assert loaded == obj
 
 
 # ===========================================================================
@@ -178,13 +206,12 @@ class TestMixedTypes:
         ar.add_raw('readme.txt', b'DEBISim2 output archive')
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            names = tar.getnames()
-            assert len(names) == 4
-            assert 'images/recon.fits' in names
-            assert 'projections/sino.npz' in names
-            assert 'meta.pyc' in names
-            assert 'readme.txt' in names
+        names = _list_members(ar.path)
+        assert len(names) == 4
+        assert 'images/recon.fits' in names
+        assert 'projections/sino.npz' in names
+        assert 'meta.pyc' in names
+        assert 'readme.txt' in names
 
 
 # ===========================================================================
@@ -201,11 +228,10 @@ class TestRAMPressure:
         ar.add_fits('large.fits', vol)
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            f = tar.extractfile(tar.getmember('large.fits'))
-            from astropy.io import fits
-            loaded = fits.open(io.BytesIO(f.read()))[0].data
-            np.testing.assert_allclose(loaded, vol, rtol=1e-5)
+        from astropy.io import fits
+        raw = _read_member(ar.path, 'large.fits')
+        loaded = fits.open(io.BytesIO(raw))[0].data
+        np.testing.assert_allclose(loaded, vol, rtol=1e-5)
 
     def test_many_files_under_pressure(self, archive_path):
         """Multiple adds with aggressive flush threshold."""
@@ -215,5 +241,4 @@ class TestRAMPressure:
             ar.add_fits(f'vol_{i:03d}.fits', v)
         ar.close()
 
-        with tarfile.open(archive_path, 'r:gz') as tar:
-            assert len(tar.getnames()) == 20
+        assert len(_list_members(ar.path)) == 20

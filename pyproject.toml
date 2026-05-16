@@ -20,7 +20,8 @@ dependencies = [
     "tqdm",
     "pydicom",
     "astropy",
-    "psutil"
+    "psutil",
+    "zstandard"
 ]
 
 [tool.uv.sources]
