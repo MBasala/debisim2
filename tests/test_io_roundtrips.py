@@ -154,7 +154,7 @@ class TestPipelineConstructor:
         assert p.archive is None
 
     def test_monolithic_constructor(self, _pipeline_deps):
-        """Monolithic constructor starts the writer subprocess."""
+        """Monolithic constructor starts the writer thread."""
         from src.debisim_pipeline import DEBISimPipeline
         sim_path, scanner, xray = _pipeline_deps
         p = DEBISimPipeline(sim_path, scanner, xray,
