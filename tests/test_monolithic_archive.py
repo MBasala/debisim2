@@ -4,7 +4,7 @@ parallel serialization, auto-selecting zstd/pigz/gzip.
 
 Verifies:
   - FITS, NPZ, pickle data survive the archive round-trip
-  - Writer subprocess starts and stops cleanly
+  - Writer thread (and serializer thread pool) start and stop cleanly
   - RAM pressure triggers flush without deadlock
   - Partial archives are valid tar files
   - Archive contains expected file entries
@@ -100,7 +100,7 @@ class TestArchiveLifecycle:
         assert os.path.exists(ar.path)
         assert _list_members(ar.path) == []
 
-    def test_writer_process_terminates(self, archive_path):
+    def test_writer_thread_terminates(self, archive_path):
         ar = MonolithicArchive(archive_path)
         assert ar._writer.is_alive()
         ar.close()

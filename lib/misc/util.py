@@ -348,6 +348,7 @@ def _try_zstd_stream(archive_path, threads):
         import zstandard
     except ImportError:
         return None, None
+    out_fh = None
     try:
         # Re-suffix to .zst so consumers know the format
         if not archive_path.endswith('.zst'):
@@ -360,6 +361,15 @@ def _try_zstd_stream(archive_path, threads):
         stream = cctx.stream_writer(out_fh)
         return (out_fh, stream), archive_path
     except Exception:
+        # Same file-handle leak the fix to _try_pigz addressed: if open()
+        # succeeded but stream_writer (or anything after) raised, close
+        # out_fh so it doesn't stay open and block the fallback compressor
+        # from opening the same path on Windows.
+        if out_fh is not None:
+            try:
+                out_fh.close()
+            except Exception:
+                pass
         return None, None
 
 
