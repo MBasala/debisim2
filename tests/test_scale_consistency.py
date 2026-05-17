@@ -420,3 +420,61 @@ class TestScatterPathScale:
         assert "self.scanner.recon_params['img_scale']" in source or \
                "recon_params" in source, \
             "Scatter path should read img_scale from scanner config"
+
+
+# ===========================================================================
+# 6. In-plane axis orientation (regression guard for GPU-direct recon)
+# ===========================================================================
+
+class TestReconOrientation:
+    """Lock in the in-plane (X/Y) orientation that the pipeline's recon
+    produces.  A previous GPU-direct refactor via direct_BP3D + parallel3d
+    flipped the Y axis relative to the legacy 2D per-slice FBP_CUDA path
+    because of a pre-existing vol_geom <-> proj_geom physical-extent
+    mismatch (vol voxels at unit=1, detector pitch at det_spacing_x).
+    Downstream code (DICOM positions, ROI labels) is calibrated to the
+    legacy orientation, so any reorganization that flips Y will mis-align
+    GT labels against the recon and cause user-visible 'noise' artifacts.
+
+    These tests fail if the recon's in-plane orientation changes from
+    the legacy convention.
+    """
+
+    def test_offcenter_dot_appears_in_correct_in_plane_quadrant(self):
+        """An off-center bright dot in the phantom must reconstruct to
+        the SAME in-plane quadrant — never to its mirror.
+        """
+        import numpy as np
+        from lib.forward_model.scanner_template import create_parallel_scanner
+
+        n_slices = 4
+        im_x = im_y = 64
+        det_spacing = 2.0
+
+        scanner = create_parallel_scanner(
+            gantry_diameter_mm=int(im_x * det_spacing),
+            pixel_size_mm=det_spacing,
+            n_slices=n_slices, n_views=120)
+
+        # Phantom: bright dot in the (high-X, low-Y) quadrant
+        phantom = np.zeros((im_x, im_y, n_slices), dtype=np.float32)
+        phantom[44:52, 12:20, 1:3] = 5.0  # im_x ~48, im_y ~16, z ~2
+
+        sino = scanner.run_fwd_projector(phantom)
+        sino_pipeline = np.moveaxis(sino, -1, 0)[:, :, ::-1].copy()
+        rec = scanner.reconstruct_data(sino_pipeline)
+        assert rec.shape == (n_slices, im_x, im_y)
+
+        # Find the argmax — should land in the same quadrant as the phantom
+        argmax = np.unravel_index(np.argmax(rec), rec.shape)
+        z, x, y = argmax
+        cx, cy = im_x // 2, im_y // 2
+
+        # High-X (>= center) and low-Y (< center) — same quadrant as phantom
+        assert x >= cx, (
+            f"In-plane X axis flipped: phantom dot at im_x≈48 (>{cx}) "
+            f"but recon argmax at im_x={x} (<{cx}).  This indicates a "
+            f"GPU-direct/parallel3d Y-axis flip regression.")
+        assert y < cy, (
+            f"In-plane Y axis flipped: phantom dot at im_y≈16 (<{cy}) "
+            f"but recon argmax at im_y={y} (>={cy})")

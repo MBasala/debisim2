@@ -97,9 +97,8 @@ class BeamHardeningCorrector:
 
         mu_eff = np.sum(spec * lac_water) / spec_sum
 
-        # Compute effective energy for diagnostic reporting
-        weights = spec * kev
-        e_eff = np.sum(kev * weights) / np.sum(weights) if weights.sum() > 0 else np.mean(kev)
+        # Compute effective energy for diagnostic reporting (mean photon energy)
+        e_eff = np.sum(kev * spec) / spec_sum if spec_sum > 0 else np.mean(kev)
 
         n_paths = 10000
         path_lengths = np.linspace(0, max_path_cm, n_paths)
@@ -173,8 +172,13 @@ class BeamHardeningCorrector:
             Maximum keV to read from spectrum.
         """
         spec_data = np.loadtxt(spectrum_path)
-        kev = spec_data[:max_kev, 0] if spec_data.shape[1] >= 2 else np.arange(10, 10 + max_kev)
-        spectrum = spec_data[:max_kev, 1] if spec_data.shape[1] >= 2 else spec_data[:max_kev, 0]
+        if spec_data.ndim == 1:
+            # Single-column spectrum: intensities only, keV implied from 10
+            kev = np.arange(10, 10 + min(max_kev, len(spec_data)))
+            spectrum = spec_data[:max_kev]
+        else:
+            kev = spec_data[:max_kev, 0] if spec_data.shape[1] >= 2 else np.arange(10, 10 + max_kev)
+            spectrum = spec_data[:max_kev, 1] if spec_data.shape[1] >= 2 else spec_data[:max_kev, 0]
 
         water = mu_handler.material('water')
         mu_water = water['mu'][:max_kev]

@@ -49,6 +49,7 @@ Decomposition.
 """
 
 from lib.decomposer.de_decomposer import *
+from lib.misc.multi_processor import MultiProcessor, worker
 
 try:
     import pygpufit.gpufit as gf
@@ -174,7 +175,6 @@ class CDMDecomposer(DEDecomposer):
 
         # Compute the energy dependent coefficients
         self.pix_no = 0
-        t = time.time()
 
         # Basis function scaling for the optimizer.
         #
@@ -196,10 +196,6 @@ class CDMDecomposer(DEDecomposer):
             Returns:    decomposed output pixels p_c, p_pe
             -----------------------------------------------------------------
             """
-
-            if (self.pix_no % 10000) == 0:
-                print("Pixel No", self.pix_no, '\tTime Elapsed:\t', \
-                    time.time() - t, 'seconds')
             self.pix_no += 1
 
             # If either projection is non-positive, return no attenuation
@@ -268,7 +264,7 @@ class CDMDecomposer(DEDecomposer):
                                            method='dogbox',
                                            args=([1.0, 1.0],))
                 else:
-                    print("Please specify type: 'mbd' or 'cpd' ")
+                    raise ValueError("Please specify type: 'mbd' or 'cpd' ")
             else:
                 # Find the roots first
                 res = op.root(_residual, self.init_val, jac=_jacobian,
@@ -299,16 +295,12 @@ class CDMDecomposer(DEDecomposer):
             return tuple(res.x)
 
         if solver == 'cpu':
-            t0 = time.time()
             mp = MultiProcessor(self.cdm_worker)
-            print("CDM is using %d processes..." % mp.num_processes)
             # Assign each worker an angle
             for angle in arange(self.nangs):
                 mp.add_job((self, sino_h[:, angle], sino_l[:, angle], angle))
             # Close out by stitching the angles back together
             res = mp.close_out()
-            t1 = time.time()
-            print("Done, multiprocessed CDM took %.5fs..." % (t1 - t0))
             res = concatenate(res, 1)
 
             # Reorder the results that were out of sync
@@ -319,23 +311,14 @@ class CDMDecomposer(DEDecomposer):
             # quick_imshow(1,2,[sino_c, sino_p])
 
         elif solver == 'vec':
-            print("CDM is using vectorization...")
-            print("Total number of projections:", self.n_sino_pxls)
             # decompose entire sinogram
-            t0 = time.time()
             vdecomp = np.vectorize(_decomp)
-            t1 = time.time()
             res = vdecomp(sino_h, sino_l)
-            t2 = time.time()
-            print("Vectorize took %.5fs, Execution took %.5fs..." \
-                  % (t1 - t0, t2 - t1))
             res = np.asarray(res)
             sino_p = res[0, :] / scp
             sino_c = res[1, :] / scc
 
         elif solver == 'gpu' and type == 'cpd':
-            print("CDM+CPD is using GPU...")
-            t0 = time.time()
             GFtol = 1e-4
             GFmaxIter = 100
 
@@ -352,11 +335,6 @@ class CDMDecomposer(DEDecomposer):
                 auto_c = np.float32(np.maximum(mean_sino * 0.8, 0.05))
                 auto_p = np.float32(np.maximum(mean_sino * 0.2, 0.01))
                 self.init_val = array([auto_p, auto_c])
-                print(f"  Auto init_val: PE={auto_p:.4f}, Compton={auto_c:.4f}, "
-                      f"mean_sino={mean_sino:.3f}")
-            else:
-                print(f"  User init_val: PE={user_init[0]:.4f}, "
-                      f"Compton={user_init[1]:.4f}")
             # User info
             GFui = concatenate((
                 [scc, scp],
@@ -396,9 +374,22 @@ class CDMDecomposer(DEDecomposer):
             GFw_ac    = ascontiguousarray(GFw, dtype=np.float32)
             GFinit_ac = ascontiguousarray(GFinit, dtype=np.float32)
 
-            GFres = gf.fit(
-                GFdata_ac, GFw_ac, gf.ModelID.COMPTON_PE, GFinit_ac, GFtol,
-                GFmaxIter, None, gf.EstimatorID.LSE, GFui_ac)
+            try:
+                GFres = gf.fit(
+                    GFdata_ac, GFw_ac, gf.ModelID.COMPTON_PE, GFinit_ac,
+                    GFtol, GFmaxIter, None, gf.EstimatorID.LSE, GFui_ac)
+            except RuntimeError as exc:
+                if 'no kernel image' in str(exc):
+                    raise RuntimeError(
+                        "pygpufit cannot run on this GPU: the installed "
+                        "wheel was built for a different CUDA compute "
+                        "capability.  Rebuild pygpufit from deps/gpufit/ "
+                        "for your GPU's arch (check `nvidia-smi --query-gpu="
+                        "compute_cap`) and reinstall, or set "
+                        "decomposer='none' in your config to skip DECT "
+                        "decomposition.  Original error: " + str(exc)
+                    ) from exc
+                raise
 
             GF_out = np.array(GFres[0], copy=True)
 
@@ -406,35 +397,11 @@ class CDMDecomposer(DEDecomposer):
             # in physical basis coefficient units.
             sino_c = GF_out[:, 0].flatten().reshape(self.sino_shape)
             sino_p = GF_out[:, 1].flatten().reshape(self.sino_shape)
-            t1 = time.time()
-
-            print("Done, GPU CDM took %.5fs..." % (t1 - t0))
-            parameters, states, chi_squares, number_iterations, execution_time = GFres
-            number_fits = self.n_sino_pxls
-            converged = states == 0
-            print('\ngpufit stats:')
-            print(
-                'iterations:      {:.2f}'.format(
-                    np.mean(number_iterations[converged])))
-            print('time:            {:.2f} s'.format(execution_time))
-
-            # get fit states
-            number_converged = np.sum(converged)
-            print('ratio converged         {:6.2f} %'.format(
-                number_converged * 1.0 / number_fits * 100))
-            print('ratio max it. exceeded  {:6.2f} %'.format(
-                np.sum(states == 1) * 1.0 / number_fits * 100))
-            print('ratio singular hessian  {:6.2f} %'.format(
-                np.sum(states == 2) * 1.0 / number_fits * 100))
-            print('ratio neg curvature MLE {:6.2f} %'.format(
-                np.sum(states == 3) * 1.0 / number_fits * 100))
 
             del GFdata, GFmaxIter, GFtol, GFui, GFw, GFinit
             del GFdata_ac, GFui_ac, GFw_ac, GFinit_ac
 
         elif solver == 'gpu' and type == 'mbd':
-            print("CDM+MBD is using GPU...")
-            t0 = time.time()
             GFtol = 1e-4
             GFmaxIter = 20
             # User info
@@ -471,37 +438,25 @@ class CDMDecomposer(DEDecomposer):
             GFdata = ascontiguousarray(GFdata, dtype=float32)
             GFw = ascontiguousarray(GFw, dtype=float32)
             GFinit = ascontiguousarray(GFinit, dtype=float32)
-            GFres = gf.fit(
-                GFdata, GFw, gf.ModelID.MATERIAL_BASIS, GFinit, GFtol,
-                GFmaxIter, None, gf.EstimatorID.LSE, GFui)
+            try:
+                GFres = gf.fit(
+                    GFdata, GFw, gf.ModelID.MATERIAL_BASIS, GFinit, GFtol,
+                    GFmaxIter, None, gf.EstimatorID.LSE, GFui)
+            except RuntimeError as exc:
+                if 'no kernel image' in str(exc):
+                    raise RuntimeError(
+                        "pygpufit cannot run on this GPU: the installed "
+                        "wheel was built for a different CUDA compute "
+                        "capability.  Rebuild pygpufit from deps/gpufit/ "
+                        "for your GPU's arch, or set decomposer='none'.  "
+                        "Original error: " + str(exc)
+                    ) from exc
+                raise
             sino_c = GFres[0][:, 0].flatten().reshape(self.sino_shape)
             sino_p = GFres[0][:, 1].flatten().reshape(self.sino_shape)
-            t1 = time.time()
-            print("Done, GPU CDM took %.5fs..." % (t1 - t0))
-            parameters, states, chi_squares, number_iterations, execution_time = GFres
-            number_fits = self.n_sino_pxls
-            converged = states == 0
-            print('\ngpufit stats:')
-            print(
-                'iterations:      {:.2f}'.format(
-                    np.mean(number_iterations[converged])))
-            print('time:            {:.2f} s'.format(execution_time))
-
-            # get fit states
-            number_converged = np.sum(converged)
-            print('ratio converged         {:6.2f} %'.format(
-                number_converged * 1.0 / number_fits * 100))
-            print('ratio max it. exceeded  {:6.2f} %'.format(
-                np.sum(states == 1) * 1.0 / number_fits * 100))
-            print('ratio singular hessian  {:6.2f} %'.format(
-                np.sum(states == 2) * 1.0 / number_fits * 100))
-            print('ratio neg curvature MLE {:6.2f} %'.format(
-                np.sum(states == 3) * 1.0 / number_fits * 100))
 
         else:
             raise NotImplementedError("%s is not implemented!" % solver)
-        print("Range of A_p:", sino_p.max(), sino_p.min())
-        print("Range of A_c:", sino_c.max(), sino_c.min())
 
         return sino_p, sino_c
         # --------------------------------------------------------------------------

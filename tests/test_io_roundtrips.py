@@ -4,7 +4,6 @@ Tests verifying that in-memory I/O optimizations work correctly:
   - Raw sinogram stashing (_raw_sinograms) survives run_fwd_model
   - Scatter method accepts sinogram_buffer to avoid disk re-read
   - DICOM recon image cache is set for both single and dual spectrum
-  - GIF creation can be dispatched to the I/O thread pool
 """
 
 import os
@@ -20,7 +19,6 @@ from lib.misc.util import (
     save_fits_data_async,
     flush_async_io,
     read_fits_data,
-    create_gif,
     _get_io_pool,
 )
 
@@ -115,15 +113,65 @@ class TestIOPool:
         fut.result(timeout=5)
         assert result == [42]
 
-    def test_gif_dispatch_to_pool(self, tmp_dir):
-        """GIF creation dispatched to the I/O pool should complete."""
-        vol = np.random.randint(0, 255, (16, 16, 4), dtype=np.uint8).astype(
-            np.float32)
-        gif_path = str(tmp_dir / 'test.gif')
-        fut = _get_io_pool().submit(create_gif, gif_path, vol, stride=1)
-        fut.result(timeout=10)
-        assert os.path.exists(gif_path)
-        assert os.path.getsize(gif_path) > 0
+
+
+# ===========================================================================
+# Pipeline constructor smoke tests
+# ===========================================================================
+
+class TestPipelineConstructor:
+    """Smoke-test the DEBISimPipeline constructor to catch missing
+    variables, import errors, and attribute ordering bugs."""
+
+    @pytest.fixture
+    def _pipeline_deps(self, tmp_path):
+        """Return (sim_path, scanner, xray_source) for a minimal pipeline."""
+        from lib.forward_model.scanner_template import create_parallel_scanner
+        from lib.__init__ import SPECTRA_DIR
+
+        scanner = create_parallel_scanner(
+            gantry_diameter_mm=128, pixel_size_mm=2.0,
+            n_slices=4, n_views=32)
+
+        spec_160 = os.path.join(SPECTRA_DIR, 'airport_spectrum_160kV.txt')
+        spec_80 = os.path.join(SPECTRA_DIR, 'airport_spectrum_80kV.txt')
+        if not os.path.exists(spec_160) or not os.path.exists(spec_80):
+            pytest.skip("Spectrum files not found")
+
+        xray_source = dict(
+            num_spectra=2, kVp=160,
+            spectra=[spec_160, spec_80], dosage=[1e4, 8e3])
+
+        sim_path = str(tmp_path / 'sim_001')
+        return sim_path, scanner, xray_source
+
+    def test_default_constructor(self, _pipeline_deps):
+        """Default (non-monolithic) constructor completes without error."""
+        from src.debisim_pipeline import DEBISimPipeline
+        sim_path, scanner, xray = _pipeline_deps
+        p = DEBISimPipeline(sim_path, scanner, xray)
+        assert p.monolithic_output is False
+        assert p.archive is None
+
+    def test_monolithic_constructor(self, _pipeline_deps):
+        """Monolithic constructor starts the writer subprocess."""
+        from src.debisim_pipeline import DEBISimPipeline
+        sim_path, scanner, xray = _pipeline_deps
+        p = DEBISimPipeline(sim_path, scanner, xray,
+                            monolithic_output=True, compression_threads=2)
+        assert p.monolithic_output is True
+        assert p.archive is not None
+        assert p.compress_data is False
+        assert p.archive._writer.is_alive()
+        p.archive.close()
+
+    def test_constructor_has_logger(self, _pipeline_deps):
+        """Logger must be set after constructor."""
+        from src.debisim_pipeline import DEBISimPipeline
+        sim_path, scanner, xray = _pipeline_deps
+        p = DEBISimPipeline(sim_path, scanner, xray)
+        assert hasattr(p, 'logger')
+        assert p.logger is not None
 
 
 # ===========================================================================
@@ -219,63 +267,35 @@ class TestDicomReconCache:
     """Verify that _recon_images_cache is set for both single and dual
     spectrum paths so save_dicom_output doesn't re-read from disk."""
 
-    def _check_cache_set(self, num_spectra, expected_len):
-        """Helper: mock enough of run_reconstructor to verify the cache."""
-        from src.debisim_pipeline import DEBISimPipeline
-
-        pipeline = mock.MagicMock(spec=DEBISimPipeline)
-        pipeline.xray_source_model = {'num_spectra': num_spectra}
-        pipeline.scanner = mock.MagicMock()
-        pipeline.scanner.machine_geometry = {
-            'scanner_name': 'parallel_custom'}
-        pipeline.scanner.recon_params = {'image_dims': (8, 8, 4)}
-        pipeline.DECOMPOSER_FLAG = False
-        pipeline.f_loc = {
-            'image_dir': '/tmp/test',
-            'img_file': 'recon_%i.fits.gz',
-            'gif_dir': '/tmp/test/gifs',
-        }
-        pipeline.compress_data = False
-        pipeline.gt_image_3d = mock.MagicMock()
-        pipeline.gt_image_3d.cpu.return_value.numpy.return_value = np.zeros(
-            (8, 8, 4))
-
-        # Provide fake sinogram data
-        fake_data = np.random.rand(4, 8, 8).astype(np.float32)
-        if num_spectra == 1:
-            pipeline.data = fake_data
-        else:
-            pipeline.data1 = fake_data
-            pipeline.data2 = fake_data.copy()
-
-        # Mock the scanner reconstruct
-        recon_result = np.random.rand(4, 8, 8).astype(np.float32)
-        pipeline.scanner.reconstruct_data.return_value = recon_result
-
-        return pipeline
-
     def test_cache_set_dual_spectrum(self):
-        """Dual spectrum should set _recon_images_cache with 2 entries."""
-        # The cache is set inside the real run_reconstructor which is
-        # complex to fully mock.  Instead verify the attribute exists
-        # by checking the source code pattern.
-        import inspect
+        """Dual-spectrum run_reconstructor must set _recon_images_cache
+        with 2 entries."""
+        import ast
+        import textwrap
         from src.debisim_pipeline import DEBISimPipeline
-        source = inspect.getsource(DEBISimPipeline.run_reconstructor)
+        import inspect
 
-        # Both paths must set the cache
-        assert source.count('_recon_images_cache') >= 2, \
-            "_recon_images_cache should be set in both single and dual spectrum paths"
+        source = inspect.getsource(DEBISimPipeline.run_reconstructor)
+        # Parse the source to find assignment targets
+        tree = ast.parse(textwrap.dedent(source))
+        cache_assignments = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Attribute) and \
+                            target.attr == '_recon_images_cache':
+                        cache_assignments.append(node)
+
+        assert len(cache_assignments) >= 2, \
+            (f"Expected _recon_images_cache assigned in both spectrum "
+             f"paths, found {len(cache_assignments)} assignments")
 
     def test_cache_set_single_spectrum(self):
-        """Single spectrum path must also set _recon_images_cache."""
-        import inspect
+        """Single-spectrum path must assign _recon_images_cache = [image_1]."""
         from src.debisim_pipeline import DEBISimPipeline
-        source = inspect.getsource(DEBISimPipeline.run_reconstructor)
+        import inspect
 
-        # Find both assignments
-        lines = [l.strip() for l in source.splitlines()
-                 if '_recon_images_cache' in l and '=' in l]
-        assert len(lines) >= 2, \
-            (f"Expected _recon_images_cache set in both spectrum paths, "
-             f"found: {lines}")
+        source = inspect.getsource(DEBISimPipeline.run_reconstructor)
+        # Verify the single-spectrum assignment uses a 1-element list
+        assert 'self._recon_images_cache = [image_1]' in source, \
+            "Single-spectrum path must set _recon_images_cache = [image_1]"

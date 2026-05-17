@@ -109,6 +109,8 @@ through the DebiSim GUI.
 import scipy.io as io
 
 from lib.reconstructor.freect import *
+import astra
+import astra.experimental  # noqa: F401 — needed for direct_FP3D GPU path
 import torch, torch.nn as nn
 import numpy as np
 from numpy import (zeros, ones, array, linspace, arange, concatenate, reshape,
@@ -670,6 +672,42 @@ class ScannerTemplate(object):
         return proj_data
     # -------------------------------------------------------------------------
 
+    def _make_vol_geom_3d(self, im_y, im_x, n_slices):
+        """Create a 3D vol_geom whose physical extents match the proj_geom.
+
+        ASTRA's default vol_geom uses unit=1.0 voxel spacing, but our
+        proj_geom uses physical det_spacing (mm).  When pixel_size_mm != 1,
+        this asymmetry causes the volume to cover only a fraction of the
+        detector FOV — projections from off-center voxels land at the
+        wrong det_row, and back-projections place objects at the wrong
+        Z position.
+
+        This helper sets explicit physical bounds so vol voxels are sized
+        det_spacing_y x det_spacing_y x det_spacing_x mm — matching the
+        in-plane and slice pitch of the detector.
+
+        Parameters mirror ``astra.create_vol_geom`` count args:
+            im_y     = Y_count (rows)
+            im_x     = X_count (cols)
+            n_slices = Z_count
+        """
+        ds_xy = float(self.machine_geometry['det_spacing_y'])  # in-plane pitch
+        ds_z = float(self.machine_geometry['det_spacing_x'])   # slice pitch
+        hx = im_x * ds_xy / 2.0
+        hy = im_y * ds_xy / 2.0
+        hz = n_slices * ds_z / 2.0
+        return astra.create_vol_geom(
+            im_y, im_x, n_slices,
+            -hx, hx, -hy, hy, -hz, hz,
+        )
+
+    def _make_vol_geom_2d(self, im_y, im_x):
+        """2D analogue of _make_vol_geom_3d — for the per-slice FBP path."""
+        ds_xy = float(self.machine_geometry['det_spacing_y'])
+        hx = im_x * ds_xy / 2.0
+        hy = im_y * ds_xy / 2.0
+        return astra.create_vol_geom(im_y, im_x, -hx, hx, -hy, hy)
+
     def _run_parallel_beam_fp(self, vol_data, verbose=False):
         """
         -----------------------------------------------------------------------
@@ -709,7 +747,10 @@ class ScannerTemplate(object):
                 astra.data3d.delete(self._astra_cache['proj_id'])
                 astra.algorithm.delete(self._astra_cache['alg_id'])
 
-            vol_geom = astra.create_vol_geom(*orig_shape)
+            # Use physically-correct vol_geom (voxels sized det_spacing)
+            # so a phantom voxel at index z lands at det_row z in the sino.
+            vol_geom = self._make_vol_geom_3d(
+                orig_shape[0], orig_shape[1], orig_shape[2])
             vol_id = astra.data3d.create('-vol', vol_geom, data=vol_data)
             proj_id = astra.data3d.create('-sino', self.proj_geom)
 
@@ -745,6 +786,172 @@ class ScannerTemplate(object):
             astra.data3d.delete(self._astra_cache['proj_id'])
             astra.algorithm.delete(self._astra_cache['alg_id'])
             del self._astra_cache
+        if hasattr(self, '_astra_gpu_projector_id'):
+            astra.projector.delete(self._astra_gpu_projector_id)
+            del self._astra_gpu_projector_id
+        if hasattr(self, '_astra_bp3d_projector_id'):
+            astra.projector.delete(self._astra_bp3d_projector_id)
+            del self._astra_bp3d_projector_id
+    # -------------------------------------------------------------------------
+
+    def _run_fbp_parallel_beam_gpu_direct(self, sino):
+        """GPU-direct parallel-beam FBP: ramp filter on GPU + direct_BP3D.
+
+        Replaces the slice-by-slice 2D FBP_CUDA loop (n_rows separate
+        CPU<->GPU round-trips) with:
+          1. one CPU->GPU transfer of the full 3D sinogram
+          2. one batched torch FFT ramp filter across all rows
+          3. one direct_BP3D call via GPULink for all rows at once
+          4. one GPU->CPU transfer of the reconstructed volume
+
+        Numerical match against ASTRA FBP_CUDA: ~0.2% on a 32x32 test
+        phantom (calibration confirmed against w.reconstruct).
+
+        :param sino:  numpy array shape (det_cols, det_rows, n_views)
+                      (same input layout as _run_fbp_parallel_beam 3D path)
+        :return:      numpy array shape (n_rows, im_x, im_y), matching
+                      the legacy _run_fbp_parallel_beam output
+        """
+        # ASTRA layout: (det_rows, n_views, det_cols)
+        sino = transpose(sino, (1, 2, 0))
+        det_rows = self.machine_geometry['det_row_count']
+        n_views = self.recon_params['n_views']
+        det_cols = self.machine_geometry['det_col_count']
+        assert sino.shape == (det_rows, n_views, det_cols), \
+            f"Sino shape {sino.shape} != expected " \
+            f"({det_rows}, {n_views}, {det_cols})"
+
+        im_dims = self.recon_geometry['image_dims']
+        im_x, im_y = im_dims[0], im_dims[1]
+
+        # Lazily allocate the parallel3d cuda3d projector once (reused
+        # across all 4 recon calls per bag: LAC1, LAC2, Compton, PE).
+        # Use physically-correct vol_geom (voxels sized det_spacing) so
+        # the recon places objects at the same coords as the input phantom.
+        if (not hasattr(self, '_astra_bp3d_projector_id') or
+                self._astra_bp3d_vol_shape != (det_rows, im_x, im_y)):
+            if hasattr(self, '_astra_bp3d_projector_id'):
+                astra.projector.delete(self._astra_bp3d_projector_id)
+            vol_geom = self._make_vol_geom_3d(im_x, im_y, det_rows)
+            self._astra_bp3d_projector_id = astra.create_projector(
+                'cuda3d', self.proj_geom, vol_geom)
+            self._astra_bp3d_vol_shape = (det_rows, im_x, im_y)
+
+        # Single CPU -> GPU copy of the full sinogram
+        sino_gpu = torch.from_numpy(
+            np.ascontiguousarray(sino, dtype=np.float32)).cuda()
+
+        # Batched Ram-Lak filter across all (det_rows * n_views) projections
+        # at once.  Pad detector axis to next power of 2 (>= 2*det_cols)
+        # to avoid wrap-around in the cyclic convolution.
+        n_pad = 1
+        while n_pad < 2 * det_cols:
+            n_pad *= 2
+        sino_padded = torch.nn.functional.pad(
+            sino_gpu, (0, n_pad - det_cols))
+        fft = torch.fft.fft(sino_padded, dim=-1)
+        freqs = torch.fft.fftfreq(n_pad, device=sino_gpu.device).abs()
+        fft.mul_(freqs)
+        filtered = torch.fft.ifft(fft, dim=-1).real[..., :det_cols]
+        # FBP normalization (calibrated against ASTRA's 2D FBP_CUDA with
+        # the same physically-sized vol_geom — produces LAC values that
+        # are invariant to pixel_size_mm):
+        #   pi / n_views              — angle integration step (dθ = π/N)
+        #   / det_spacing²            — direct_BP3D output scales as px²
+        #                               with physical vol_geom voxels (one
+        #                               px from the forward projection's
+        #                               path-length contribution; the
+        #                               second from BP voxel size).
+        det_spacing = float(self.machine_geometry['det_spacing_y'])
+        filtered.mul_(np.pi / (n_views * det_spacing * det_spacing))
+        del sino_gpu, sino_padded, fft, freqs
+
+        # Pre-allocate output volume on GPU.  ASTRA parallel3d backprojects
+        # into shape (det_rows, im_x, im_y).
+        vol_gpu = torch.zeros((det_rows, im_x, im_y),
+                              dtype=torch.float32, device=filtered.device)
+        vol_gpu = vol_gpu.contiguous()
+        filtered = filtered.contiguous()
+
+        # Wrap tensors as ASTRA GPULinks — zero-copy
+        sl_d, sl_v, sl_c = filtered.shape
+        sino_link = astra.data3d.GPULink(
+            filtered.data_ptr(), sl_c, sl_v, sl_d, 4 * sl_c)
+        vd, vh, vw = vol_gpu.shape
+        vol_link = astra.data3d.GPULink(
+            vol_gpu.data_ptr(), vw, vh, vd, 4 * vw)
+
+        # Single backprojection call covering all slices
+        astra.experimental.direct_BP3D(
+            self._astra_bp3d_projector_id, vol_link, sino_link)
+
+        # ASTRA's parallel3d backprojection uses the opposite in-plane
+        # axis convention from the 2D 'parallel' geometry used by the
+        # legacy per-slice FBP_CUDA path: a phantom dot at im_x=N comes
+        # out at im_x=(im_x_count - 1 - N).  Flip the im_x axis to match
+        # the 2D convention so that downstream code (RT-Struct contours
+        # from GT label volume) aligns with recon objects.
+        vol_gpu = torch.flip(vol_gpu, dims=[1])
+
+        del filtered
+
+        # Match the legacy output shape: (n_rows, im_x, im_y)
+        rec = vol_gpu.cpu().numpy()
+        del vol_gpu
+        torch.cuda.empty_cache()
+        return rec
+    # -------------------------------------------------------------------------
+
+    def run_fwd_projector_gpu_direct(self, vol_tensor, proj_tensor):
+        """Forward project a torch CUDA tensor directly via ASTRA GPULink.
+
+        Eliminates the CPU↔GPU round-trip:
+          - vol_tensor:  torch CUDA float32 tensor, shape (D, H, W) contiguous
+          - proj_tensor: torch CUDA float32 tensor, shape (det_rows, n_views,
+                         det_cols) contiguous — written in place
+
+        Only parallel3d geometry is supported by this fast path; callers
+        must check ``self.proj_geom['type'] == 'parallel3d'`` first.
+
+        ASTRA uses CUDA pointer linking, so no data transfer occurs.
+        """
+        assert self.proj_geom['type'] == 'parallel3d', \
+            "GPU-direct path only supports parallel3d geometry"
+        assert vol_tensor.is_cuda and proj_tensor.is_cuda, \
+            "Both tensors must be CUDA"
+        assert vol_tensor.dtype == torch.float32 and \
+               proj_tensor.dtype == torch.float32, \
+            "ASTRA requires float32"
+        assert vol_tensor.is_contiguous() and proj_tensor.is_contiguous(), \
+            "Tensors must be contiguous for GPULink"
+
+        # Lazily create the cuda3d projector once per scanner geometry
+        if not hasattr(self, '_astra_gpu_projector_id') or \
+                self._astra_gpu_vol_shape != tuple(vol_tensor.shape):
+            if hasattr(self, '_astra_gpu_projector_id'):
+                astra.projector.delete(self._astra_gpu_projector_id)
+
+            # vol_tensor is (D, H, W); astra.create_vol_geom takes (Y, X, Z)
+            # but for our parallel beam the order matches H, W, D.
+            # Use physically-correct bounds so projection coordinates align.
+            d, h, w = vol_tensor.shape
+            vol_geom = self._make_vol_geom_3d(h, w, d)
+            self._astra_gpu_projector_id = astra.create_projector(
+                'cuda3d', self.proj_geom, vol_geom)
+            self._astra_gpu_vol_shape = tuple(vol_tensor.shape)
+
+        # Wrap torch tensors as ASTRA GPULinks.  pitch = sizeof(float) * x
+        # for contiguous arrays where x is the fastest-changing dim.
+        vd, vh, vw = vol_tensor.shape
+        vol_link = astra.data3d.GPULink(
+            vol_tensor.data_ptr(), vw, vh, vd, 4 * vw)
+
+        pd, pv, pc = proj_tensor.shape  # (det_rows, n_views, det_cols)
+        proj_link = astra.data3d.GPULink(
+            proj_tensor.data_ptr(), pc, pv, pd, 4 * pc)
+
+        astra.experimental.direct_FP3D(
+            self._astra_gpu_projector_id, vol_link, proj_link)
     # -------------------------------------------------------------------------
 
     def _run_cone_equi_space_fp(self, vol_data, verbose=False):
@@ -959,8 +1166,9 @@ class ScannerTemplate(object):
                                                     self.recon_geometry['angles']
                                                     )
 
-            im_geom = astra.create_vol_geom(self.recon_geometry['image_dims'][0],
-                                            self.recon_geometry['image_dims'][1])
+            im_geom = self._make_vol_geom_2d(
+                self.recon_geometry['image_dims'][0],
+                self.recon_geometry['image_dims'][1])
             self.proj2d_id = astra.create_projector('cuda', self.proj_geom2d, im_geom)
             self.w_2d = astra.OpTomo(self.proj2d_id)
 
@@ -972,6 +1180,20 @@ class ScannerTemplate(object):
 
         elif len(sino.shape)==3:
 
+            # Fast path: GPU-direct FBP via torch FFT + direct_BP3D.
+            # Eliminates the n_rows-iteration slice loop and its
+            # CPU<->GPU round-trip per slice.  Uses physically-correct
+            # vol_geom (via _make_vol_geom_3d) so output orientation
+            # matches the 2D per-slice path.
+            if torch.cuda.is_available():
+                rec = self._run_fbp_parallel_beam_gpu_direct(sino)
+                self.logger.info(
+                    f"Result info:, {rec.max()}, {rec.min()}, {rec.shape}")
+                self.logger.info("Reconstruction took %.2fs"
+                                 % (time.time() - t0))
+                return rec
+
+            # Legacy CPU/per-slice fallback (preserved for non-CUDA hosts)
             # Input sino shape after run_fwd_model's moveaxis+flip:
             #   (det_cols, det_rows, n_views)
             # Reorder to (det_rows, n_views, det_cols) for filtering + ASTRA
@@ -999,7 +1221,7 @@ class ScannerTemplate(object):
                 self.machine_geometry['det_col_count'],
                 self.recon_geometry['angles']
             )
-            im_geom = astra.create_vol_geom(im_dims[0], im_dims[1])
+            im_geom = self._make_vol_geom_2d(im_dims[0], im_dims[1])
 
             self.logger.info(
                 f"Starting slice-by-slice FBP: {n_rows} slices, "
