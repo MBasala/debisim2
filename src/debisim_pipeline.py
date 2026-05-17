@@ -28,7 +28,6 @@ import numpy as np
 import scipy.ndimage as sptx
 import torch
 import torch.nn as nn
-from typing import List, Any, Optional
 import astra
 from numpy import (array, zeros, zeros_like, ones, arange, loadtxt,
                    log, exp, clip, unique, moveaxis, newaxis, float32, int16,
@@ -69,8 +68,8 @@ from lib.forward_model.scanner_template import ScannerTemplate
 from lib.forward_model.scatter_simulator import ScatterSimulator
 from lib.decomposer.cdm_decomposer import CDMDecomposer
 from lib.misc.util import (save_fits_data, save_fits_data_async, flush_async_io,
-                            read_fits_data, get_logger,
-                            submit_async_io, MonolithicArchive)
+                            read_fits_data, create_gif, get_logger,
+                            _get_io_pool)
 
 if torch.cuda.is_available():
     torch.set_default_tensor_type(torch.cuda.FloatTensor)
@@ -196,6 +195,7 @@ default_file_locations = dict(
     image_dir='images/',
     sino_dir='projections/',
     gt_dir='ground_truth/',
+    gif_dir='gifs/',
     sino_file='sino_%i.fits.gz',
     img_file='recon_image_%i.fits.gz',
     gt_image='gt_label_image.fits.gz',
@@ -220,23 +220,21 @@ class DEBISimPipeline(object):
             mu_handler=None,
             debug=False,
             logfile=None,
-            compress_data=False,
-            monolithic_output=False,
-            compression_threads=0
+            compress_data=False
     ):
         """
         ------------------------------------------------------------------------
         Constructor for the DEBISimPipeline Class.
 
-        :param sim_path: The path to the simulation directory. When the simulation
-                         is complete, this directory will be populated with
-                         the subdirectories images/, sinograms/, and
-                         ground_truth/ containing the related data.
+        :param sim_path: The path to simulation directory - when the simulation 
+                         is complete this directory will be populated with 
+                         the subdirectories images/, sinograms/ and 
+                         ground_truth/ containing the res[ectively data.  
                          
         :param scanner_model: An instance of the ScannerTemplate where the 
                               scanner specifications are given.
         
-        :param xray_source_model: Dictionary specifying the X-ray source
+        :param xray_source_model: dictionary specifying the xray source 
                              specifications. See Module Description for details
 
         :param mu_handler:    A MuDatabaseHandler object (optional)
@@ -269,7 +267,7 @@ class DEBISimPipeline(object):
         os.makedirs(self.f_loc['simulation_dir'], exist_ok=True)
 
         # Assign absolute paths to all simulation files
-        for sim_file in ['image_dir', 'sino_dir', 'gt_dir']:
+        for sim_file in ['image_dir', 'sino_dir', 'gt_dir', 'gif_dir']:
             self.f_loc[sim_file] = os.path.join(self.f_loc['simulation_dir'],
                                                 self.f_loc[sim_file])
 
@@ -300,6 +298,16 @@ class DEBISimPipeline(object):
 
         self.mu.calculate_lac_hu_values('water', spectra)
 
+        if self.logfile is None:
+            self.logfile = os.path.join(self.f_loc['simulation_dir'],
+                                        'debisim_bag.log')
+            if not os.path.exists(self.logfile):
+                open(self.logfile, 'w+').close()
+
+        self.logger = get_logger('DEBISIM', self.logfile)
+
+        header = ['CT Specifications', '']
+
         # LAC unit scaling for the forward model energy loop.
         #
         # The mu database stores mass attenuation coefficients in cm²/g.
@@ -329,36 +337,10 @@ class DEBISimPipeline(object):
         self.apply_bhc = True   # water-based BHC (sinogram domain)
         self.apply_mar = False  # NMAR metal artifact reduction
 
-        # Monolithic archive mode — all outputs stream into a single
-        # .tar.gz via a subprocess with its own GIL.  Per-file FITS
-        # compression is disabled (the archive handles compression).
-        self.monolithic_output = monolithic_output
-        self.archive = None
-        if monolithic_output:
-            self.compress_data = False  # archive compresses everything
-            archive_path = self.f_loc['simulation_dir'].rstrip('/\\') + '.tar.gz'
-            self.archive = MonolithicArchive(
-                archive_path,
-                compression_threads=compression_threads,
-                ram_limit_fraction=0.5,
-            )
-
-        if self.logfile is None:
-            self.logfile = os.path.join(self.f_loc['simulation_dir'],
-                                        'debisim_bag.log')
-            if not os.path.exists(self.logfile):
-                open(self.logfile, 'w+').close()
-
-        self.logger = get_logger('DEBISIM', self.logfile)
-
-        if self.archive is not None:
-            self.archive._logger = self.logger
-
-        header = ['CT Specifications', '']
         print_table = []
 
         print_table.append(['Initialization Time',
-                            time.strftime('%m-%d-%Y %H:%M:%S',
+                            time.strftime('%m-%d-%Y %H:%M:%S', 
                                           time.localtime())])
         print_table.append(['Simulation Directory',
                             self.f_loc['simulation_dir']])
@@ -377,7 +359,7 @@ class DEBISimPipeline(object):
     def create_random_simulation_instance(self,
                                           baggage_creator_args,
                                           prior_image=None,
-                                          prior_list=None,
+                                          prior_list=[],
                                           save_images=['gt'],
                                           slicewise=False,
                                           template=2
@@ -399,8 +381,6 @@ class DEBISimPipeline(object):
         """
 
         # run BaggageCreator3D with the input creator args ---------------------
-        if prior_list is None:
-            prior_list = []
         bag_vol_shape = list(self.image_shape_3d)
         # bag_vol_shape[2] = max(bag_vol_shape[2], 350)
 
@@ -430,7 +410,7 @@ class DEBISimPipeline(object):
                                                  debug=self.debug
                                          )
 
-        # get Object3D list — either calibration phantom or random bag
+        # obtain Object3D list — either calibration phantom or random bag
         _bag_args = dict(baggage_creator_args)
         prevent_overlap = _bag_args.pop('prevent_overlap', False)
         phantom_mode = _bag_args.pop('phantom_mode', False)
@@ -481,7 +461,7 @@ class DEBISimPipeline(object):
 
         self.sf_obj_list = sf_obj_list
 
-        # create compton_image - this is used for forward modeling
+        # create compton_image - this is used for forward modelling
         self.compton_image_3d = torch.zeros_like(self.gt_image_3d,
                                                  dtype=T_FLOAT)
 
@@ -507,8 +487,8 @@ class DEBISimPipeline(object):
 
         self.mu.calculate_lac_hu_values('water', spectra)
 
-        sim_obj_dict = {}
-        material_curve = {}
+        sim_obj_dict = dict()
+        material_curve = dict()
 
         # iterating through each object
         for k, sf_obj in enumerate(sf_obj_list):
@@ -559,7 +539,9 @@ class DEBISimPipeline(object):
         # ---------------------------------------------------------------------
 
         # save the dictionary of objects as metadata
-        self._save_pickle(self.f_loc['sl_metadata'], sim_obj_dict)
+        with open(self.f_loc['sl_metadata'], 'wb') as f:
+            pickle.dump(sim_obj_dict, f)
+            f.close()
 
         self.logger.info(f"Metadata generated and saved "
                          f"at {self.f_loc['sl_metadata']}")
@@ -657,8 +639,8 @@ class DEBISimPipeline(object):
         spectra = [loadtxt(spec)[:self.maxkV,1]
                    for spec in self.xray_source_model['spectra']]
 
-        sim_obj_dict = {}
-        material_curve = {}
+        sim_obj_dict = dict()
+        material_curve = dict()
 
         # TODO: check load sim with liquid objects
         for k, sf_obj in enumerate(sf_obj_list):
@@ -686,7 +668,9 @@ class DEBISimPipeline(object):
 
             sim_obj_dict['%i' % sf_obj['label']] = sf_obj.copy()
 
-        self._save_pickle(self.f_loc['sl_metadata'], sim_obj_dict)
+        with open(self.f_loc['sl_metadata'], 'wb') as f:
+            pickle.dump(sim_obj_dict, f)
+            f.close()
 
         self.logger.info("\nMetadata generated")
         # ----------------------------------------------------------------------
@@ -810,15 +794,7 @@ class DEBISimPipeline(object):
         # passed to ASTRA (which runs its own GPU kernels).  Keeping this on
         # CPU means torch doesn't hog VRAM while ASTRA needs it.
         mat_indices = {mat: idx for idx, mat in enumerate(material_list)}
-
-        # max_label must cover ALL labels including liquid labels that may
-        # exceed gt_image_3d.max() (e.g. when liquid fill partially failed).
         max_label = int(self.gt_image_3d.max().item()) + 1
-        for sf_obj in self.sf_obj_list:
-            max_label = builtins.max(max_label, sf_obj['label'] + 1)
-            if sf_obj.get('lqd_flag') and sf_obj.get('lqd_param'):
-                max_label = builtins.max(
-                    max_label, sf_obj['lqd_param']['lqd_label'] + 1)
 
         _label_to_mat_idx = np.full(max_label, -1, dtype=NP_INT)
         for sf_obj in self.sf_obj_list:
@@ -831,8 +807,11 @@ class DEBISimPipeline(object):
                     _label_to_mat_idx[sf_obj['lqd_param']['lqd_label']] = \
                         mat_indices[lqd_mat]
 
-        # ---- Build LUT + index map on GPU ------------------------------------
-        # All data lives on GPU end-to-end.  No CPU↔GPU transfers in the loop.
+        # ---- Build LUT + index maps on BOTH CPU and GPU ----------------------
+        # CPU RAM is plentiful (64 GB) so we duplicate the index map:
+        #   - CPU copy:  feeds ASTRA via np.take (no GPU→CPU transfer per keV)
+        #   - GPU copy:  feeds torch post-processing (exp, noise, accumulate)
+        # The LUT itself is tiny (n_mats × n_keV ≈ 7 KB).
         _gt_device = self.gt_image_3d.device
 
         _label_to_mat_idx_gpu = torch.tensor(
@@ -842,32 +821,35 @@ class DEBISimPipeline(object):
         del gt_clamped, _label_to_mat_idx_gpu
 
         bg_mask_gpu = (voxel_mat_idx_gpu < 0)
-        voxel_mat_idx_safe_gpu = voxel_mat_idx_gpu.clamp(min=0).long()
+        voxel_mat_idx_safe_gpu = voxel_mat_idx_gpu.clamp(min=0)
         del voxel_mat_idx_gpu
 
-        # Pre-build per-keV LAC lookup table on GPU (n_mats × n_keV ≈ 7 KB)
+        # CPU copies for ASTRA (duplicated — CPU RAM is cheap)
+        voxel_mat_idx_safe_cpu = voxel_mat_idx_safe_gpu.cpu().numpy()
+        bg_mask_cpu = bg_mask_gpu.cpu().numpy()
+
+        # Pre-build per-keV LAC lookup table on both CPU and GPU
         n_kev = len(self.keV_range[:curr_spectrum.size])
         n_mats = len(material_list)
-        lac_lut_cpu = np.zeros((n_mats, n_kev), dtype=np.float32)
+        # Note: ASTRA requires float32 input regardless of NP_FLOAT.
+        # The LUT is built at NP_FLOAT precision, then the ref_image fed to
+        # ASTRA is always np.float32 (cast at the projector boundary).
+        lac_lut_cpu = np.zeros((n_mats, n_kev), dtype=NP_FLOAT)
         for mat in material_list:
             idx = mat_indices[mat]
             for ki in range(n_kev):
                 lac_lut_cpu[idx, ki] = self.material_curve[mat][ki]
-        lac_lut_gpu = torch.tensor(lac_lut_cpu, device=_gt_device,
-                                   dtype=torch.float32)
-        del lac_lut_cpu
+        lac_lut_gpu = torch.tensor(lac_lut_cpu, device=_gt_device)
 
-        # Detect whether the GPU-direct ASTRA path is available
-        is_parallel_beam = (
-            torch.cuda.is_available()
-            and hasattr(self.scanner, 'proj_geom')
-            and self.scanner.proj_geom is not None
-            and self.scanner.proj_geom.get('type') == 'parallel3d'
-        )
+        # Pre-allocate reusable CPU buffer for ASTRA input (avoids alloc per keV)
+        ref_image_cpu = np.empty(voxel_mat_idx_safe_cpu.shape, dtype=np.float32)
 
         # ---- Temporarily move large tensors off GPU --------------------------
-        # gt_image_3d / compton_image_3d are large (~2 GB on a 1024³ volume)
-        # and not needed until after the energy loop.
+        # gt_image_3d and compton_image_3d are ~2 GB each on a 1024×1024
+        # volume.  They're no longer needed until after the energy loop.
+        # GPU now holds: voxel_mat_idx_safe_gpu (~350 MB) + bg_mask_gpu (~90 MB)
+        #              + lac_lut_gpu (~7 KB) + projection_buffer (~130 MB)
+        #              ≈ 570 MB, leaving ~11 GB for ASTRA.
         self.gt_image_3d = self.gt_image_3d.cpu()
         self.compton_image_3d = self.compton_image_3d.cpu()
         if hasattr(self, 'pe_image_3d') and torch.is_tensor(self.pe_image_3d):
@@ -875,7 +857,11 @@ class DEBISimPipeline(object):
         if hasattr(self, 'zeff_image_3d') and torch.is_tensor(self.zeff_image_3d):
             self.zeff_image_3d = self.zeff_image_3d.cpu()
 
-        # Free torch's cached GPU memory so ASTRA can use the full VRAM
+        # The energy loop uses CPU copies for ASTRA, so free the GPU
+        # index/mask tensors too — they were only needed to build the CPU copies.
+        del voxel_mat_idx_safe_gpu, bg_mask_gpu, lac_lut_gpu
+
+        # Free torch's cached GPU memory so ASTRA can use the full VRAM.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             try:
@@ -891,129 +877,58 @@ class DEBISimPipeline(object):
                     pass
         # --------------------------------------------------------------------------
 
-        # Accumulation buffer on GPU
+        # Accumulation buffer on GPU — post-processing (exp, noise) runs on GPU.
         proj_shape = (self.scanner_geometry['det_row_count'],
                       self.reconstruction_geometry['n_views'],
                       self.scanner_geometry['det_col_count'])
-        projection_buffer_gpu = torch.zeros(proj_shape, dtype=torch.float32,
+        projection_buffer_gpu = torch.zeros(proj_shape, dtype=T_FLOAT,
                                             device=_gt_device)
+
+        # ---- Per-keV LUT gather + ASTRA projection ----------------------------
+        vol_shape = voxel_mat_idx_safe_cpu.shape
+        # ASTRA requires float32 at the boundary — cast here if NP_FLOAT
+        # is a higher precision type.
+        ref_image_cpu = np.empty(vol_shape, dtype=np.float32)  # ASTRA: fixed f32
 
         kev_list = list(self.keV_range[:curr_spectrum.size])
         kev_iter = tqdm(kev_list)
 
-        if is_parallel_beam:
-            # ============ GPU-DIRECT FAST PATH ================================
-            # No CPU↔GPU transfers in the loop.  Per keV:
-            #   1. GPU LUT lookup → ref_image_gpu (single torch op)
-            #   2. direct_FP3D reads ref_image_gpu, writes proj_curr_gpu
-            #   3. Beer-Lambert + noise + accumulate on GPU
-            self.logger.info(
-                "Using GPU-direct ASTRA path (direct_FP3D + GPULink)")
+        for e in kev_iter:
+            k = e - self.keV_range[0]
 
-            # Pre-allocate GPU tensors.  ASTRA wants (D, H, W) volume layout
-            # and (det_rows, n_views, det_cols) projection layout.
-            h, w, d = voxel_mat_idx_safe_gpu.shape
-            ref_image_gpu = torch.empty((d, h, w), dtype=torch.float32,
-                                        device=_gt_device).contiguous()
-            proj_curr_gpu = torch.empty(proj_shape, dtype=torch.float32,
-                                        device=_gt_device).contiguous()
+            # CPU LUT gather: map each voxel to its LAC at this energy level
+            np.take(lac_lut_cpu[:, k], voxel_mat_idx_safe_cpu,
+                    out=ref_image_cpu)
+            ref_image_cpu[bg_mask_cpu] = 0.0
 
-            # Pre-permute the index/mask to (D, H, W) once (matches ASTRA layout)
-            voxel_idx_dhw = voxel_mat_idx_safe_gpu.permute(2, 0, 1).contiguous()
-            bg_mask_dhw = bg_mask_gpu.permute(2, 0, 1).contiguous()
-            del voxel_mat_idx_safe_gpu, bg_mask_gpu
+            # --- ASTRA GPU — forward projection ----
+            proj_np = self.scanner.run_fwd_projector(ref_image_cpu)
 
-            for e in kev_iter:
-                k = e - self.keV_range[0]
+            # --- torch GPU — Beer-Lambert + noise + accumulate ----------------
+            curr = torch.as_tensor(proj_np, device=_gt_device)
+            del proj_np
 
-                # GPU LUT gather: ref_image_gpu[i,j,l] = lac_lut[idx[i,j,l], k]
-                # Single fused GPU op — no Python loop, no transfers.
-                ref_image_gpu = lac_lut_gpu[voxel_idx_dhw, k]
-                ref_image_gpu = ref_image_gpu.masked_fill(bg_mask_dhw, 0.0)
-                ref_image_gpu = ref_image_gpu.contiguous()
+            scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
+            curr.neg_()
+            curr.exp_()
+            curr.mul_(scale)
 
-                # ASTRA reads ref_image_gpu, writes proj_curr_gpu — no copies
-                self.scanner.run_fwd_projector_gpu_direct(
-                    ref_image_gpu, proj_curr_gpu)
+            if add_poisson_noise:
+                curr.clamp_(min=0.0)
+                curr = torch.poisson(curr)
 
-                # Beer-Lambert + noise + accumulate — all on GPU
-                scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
-                curr = proj_curr_gpu.neg().exp_().mul_(scale)
+            if add_system_noise:
+                curr.add_(torch.randn_like(curr), alpha=shot_gain)
 
-                if add_poisson_noise:
-                    curr.clamp_(min=0.0)
-                    curr = torch.poisson(curr)
+            projection_buffer_gpu.add_(curr)
+            del curr
+            pc_sum += scale
 
-                if add_system_noise:
-                    curr.add_(torch.randn_like(curr), alpha=shot_gain)
+            kev_iter.set_description(
+                f"Processing Energy Level, {e} keV:\t", refresh=True)
 
-                projection_buffer_gpu.add_(curr)
-                pc_sum += scale
-
-                kev_iter.set_description(
-                    f"GPU keV {e}\t", refresh=True)
-
-            del ref_image_gpu, proj_curr_gpu, voxel_idx_dhw, bg_mask_dhw
-            del lac_lut_gpu
-        else:
-            # ============ CPU FALLBACK PATH (cone-beam, non-CUDA) =============
-            # Double-buffered: prefetch thread fills next ref_image on CPU
-            # while ASTRA projects the current one.
-            self.logger.info(
-                "Using CPU fallback ASTRA path (geometry not parallel3d "
-                "or no CUDA)")
-
-            voxel_mat_idx_safe_cpu = voxel_mat_idx_safe_gpu.cpu().numpy()
-            bg_mask_cpu = bg_mask_gpu.cpu().numpy()
-            lac_lut_cpu = lac_lut_gpu.cpu().numpy()
-            del voxel_mat_idx_safe_gpu, bg_mask_gpu, lac_lut_gpu
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-            vol_shape = voxel_mat_idx_safe_cpu.shape
-            ref_buf_a = np.empty(vol_shape, dtype=np.float32)
-            ref_buf_b = np.empty(vol_shape, dtype=np.float32)
-
-            def _prefetch(buf, k):
-                np.take(lac_lut_cpu[:, k], voxel_mat_idx_safe_cpu, out=buf)
-                buf[bg_mask_cpu] = 0.0
-
-            from concurrent.futures import ThreadPoolExecutor
-            prefetch_pool = ThreadPoolExecutor(
-                max_workers=1, thread_name_prefix='kev_prefetch')
-            _prefetch(ref_buf_a, 0)
-
-            for i, e in enumerate(kev_iter):
-                prefetch_fut = None
-                if i + 1 < len(kev_list):
-                    next_k = kev_list[i + 1] - self.keV_range[0]
-                    prefetch_fut = prefetch_pool.submit(
-                        _prefetch, ref_buf_b, next_k)
-
-                proj_np = self.scanner.run_fwd_projector(ref_buf_a)
-                curr = torch.as_tensor(proj_np, device=_gt_device)
-                del proj_np
-
-                scale = curr_pc * curr_spectrum[e - 10] * system_gain * e
-                curr.neg_().exp_().mul_(scale)
-                if add_poisson_noise:
-                    curr.clamp_(min=0.0)
-                    curr = torch.poisson(curr)
-                if add_system_noise:
-                    curr.add_(torch.randn_like(curr), alpha=shot_gain)
-                projection_buffer_gpu.add_(curr)
-                del curr
-                pc_sum += scale
-
-                if prefetch_fut is not None:
-                    prefetch_fut.result()
-                ref_buf_a, ref_buf_b = ref_buf_b, ref_buf_a
-                kev_iter.set_description(
-                    f"CPU keV {e}\t", refresh=True)
-
-            prefetch_pool.shutdown(wait=False)
-            del ref_buf_a, ref_buf_b
-            del voxel_mat_idx_safe_cpu, bg_mask_cpu, lac_lut_cpu
+        del ref_image_cpu
+        del voxel_mat_idx_safe_cpu, bg_mask_cpu, lac_lut_cpu
 
         # Free ASTRA's cached GPU objects now that the energy sweep is done
         self.scanner.cleanup_astra_cache()
@@ -1042,9 +957,11 @@ class DEBISimPipeline(object):
 
         self.logger.info("Sinogram Created ...")
 
-        self._save_output(self.f_loc['sino_file']%spectrum,
-                       projection_buffer)
+        save_fits_data_async(self.f_loc['sino_file']%spectrum,
+                       projection_buffer,
+                       self.compress_data)
 
+        self.logger.info("Sinogram saved as %s"%(self.f_loc['sino_file']%spectrum))
         self.logger.info(f"Time Taken: {time.time() - t0}")
 
         return projection_buffer
@@ -1093,9 +1010,7 @@ class DEBISimPipeline(object):
             )
         else:
             flush_async_io()
-            _field = 1 if getattr(self, 'compress_data', False) else 0
-            sino_buf = read_fits_data(
-                self.f_loc['sino_file'] % spectrum, _field)
+            sino_buf = read_fits_data(self.f_loc['sino_file']%spectrum, 0)
 
         self.sino = sino_buf[slice_no, :, :].copy()
 
@@ -1154,6 +1069,8 @@ class DEBISimPipeline(object):
         s_projn = torch.add(s_projn,  log(pc_sum))
         self.scatter_sino = s_projn.cpu().numpy()
 
+        self.scatter_recon = self.scanner.reconstruct_data(self.scatter_sino)
+
         spectra = [loadtxt(spec)[:self.maxkV,1]
                    for spec in self.xray_source_model['spectra']]
 
@@ -1162,25 +1079,12 @@ class DEBISimPipeline(object):
         cmin, cmax, offset = -1000, 3.2e4, 0
         scale = self.scanner.recon_params['img_scale']
 
-        # ---- Audit fix (mirrors BHC + decomposer scaling fixes) -----------
-        # The scatter and direct sinograms are in PHYSICAL line-integral
-        # units (cm⁻¹·cm after the vol_geom physical-extent fix in a4d97b9).
-        # The recon chain expects the sino in (1/self.scale)× scale so that
-        # FBP_CUDA recovers LAC in cm⁻¹ (matching mu_w['lac_1'] used in the
-        # HU formula below).  Previously the scatter path skipped this
-        # rescale and the recon came out in mm⁻¹ — HU would be off by 10×.
-        sino_correction = 1.0 / self.scale \
-            if abs(self.scale - 1.0) > 1e-6 else 1.0
-
-        self.scatter_recon = self.scanner.reconstruct_data(
-            self.scatter_sino * sino_correction)
         self.scatter_recon *= scale
         self.scatter_recon = \
             (self.scatter_recon - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
         self.scatter_recon = clip(self.scatter_recon, cmin, cmax).astype(STORAGE_DTYPE)
 
-        self.recon = self.scanner.reconstruct_data(
-            self.sino * sino_correction)
+        self.recon = self.scanner.reconstruct_data(self.sino)
         self.recon *= scale
         self.recon = (self.recon - mu_w['lac_1']) / mu_w['lac_1'] * 1000 + offset
         self.recon = clip(self.recon, cmin, cmax).astype(STORAGE_DTYPE)
@@ -1219,54 +1123,6 @@ class DEBISimPipeline(object):
         
         elif mode=='manual':
             self.create_simulation_from_sl_file(sf_file, **sim_args)
-    # --------------------------------------------------------------------------
-
-    def _to_arcname(self, abs_path):
-        """Convert an absolute path to a forward-slash archive-relative path."""
-        abs_norm = os.path.normpath(abs_path).replace(os.sep, '/')
-        sim_norm = os.path.normpath(
-            self.f_loc['simulation_dir']).replace(os.sep, '/').rstrip('/')
-        if abs_norm.startswith(sim_norm + '/'):
-            return abs_norm[len(sim_norm) + 1:]
-        return abs_norm.split('/')[-1]
-
-    def _save_output(self, path, array, compress=None):
-        """Save an array — routes to archive (monolithic) or async FITS.
-
-        :param path:      absolute path or relative to simulation_dir
-        :param array:     numpy array to save
-        :param compress:  override compress flag; defaults to self.compress_data
-        """
-        if compress is None:
-            compress = self.compress_data
-        if self.monolithic_output and self.archive is not None:
-            arcname = self._to_arcname(path)
-            self.archive.add_fits(arcname, array, compress)
-            self.logger.info(f"Archived: {arcname}")
-        else:
-            save_fits_data_async(path, array, compress)
-            self.logger.info(f"Saving: {path}")
-
-    def _save_npz(self, path, *args, **arrays):
-        """Save numpy arrays as .npz — routes to archive or disk."""
-        if self.monolithic_output and self.archive is not None:
-            kw = dict(arrays)
-            for i, a in enumerate(args):
-                kw[f'arr_{i}'] = a
-            arcname = self._to_arcname(path)
-            self.archive.add_npz(arcname, **kw)
-            self.logger.info(f"Archived: {arcname}")
-        else:
-            savez_compressed(path, *args, **arrays)
-            self.logger.info(f"Saving: {path}")
-
-    def _save_pickle(self, path, obj):
-        """Save a pickle — routes to archive or disk."""
-        if self.monolithic_output and self.archive is not None:
-            self.archive.add_pickle(self._to_arcname(path), obj)
-        else:
-            with open(path, 'wb') as f:
-                pickle.dump(obj, f)
     # --------------------------------------------------------------------------
 
     def run_fwd_model(self,
@@ -1549,8 +1405,9 @@ class DEBISimPipeline(object):
 
             self.f_loc['sino_file'] = os.path.join(self.f_loc['sino_dir'],
                                                     'sino_%i.fits.gz')
-            self._save_output(self.f_loc['sino_file'] % 1,
-                           self.data)
+            save_fits_data_async(self.f_loc['sino_file'] % 1,
+                           self.data,
+                           self.compress_data)
 
             self.data = moveaxis(self.data, -1, 0)
             self.data = self.data[:, :, ::-1]
@@ -1569,12 +1426,12 @@ class DEBISimPipeline(object):
                 self.data2[:, s::n_seqs, :] = raw_sinos[1][:, s::n_seqs, :]
 
             self.f_loc['sino_file'] = 'sino_%i.fits.gz'
-            self._save_output(self.f_loc['sino_file'] % 1, self.data1)
+            save_fits_data_async(self.f_loc['sino_file'] % 1, self.data1, self.compress_data)
 
             self.data1 = moveaxis(self.data1, -1, 0)
             self.data1 = self.data1[:, :, ::-1]
 
-            self._save_output(self.f_loc['sino_file'] % 2, self.data2)
+            save_fits_data_async(self.f_loc['sino_file'] % 2, self.data2, self.compress_data)
 
             self.data2 = moveaxis(self.data2, -1, 0)
             self.data2 = self.data2[:, :, ::-1]
@@ -1624,91 +1481,29 @@ class DEBISimPipeline(object):
             if basis_fn is not None:
                 cdm_sim.set_basis_functions(**basis_fn)
 
-            nrows = self.data1.shape[1]
+            sino_pe = zeros_like(self.data1)
+            sino_c  = zeros_like(self.data2)
+            nrows   = self.data1.shape[1]
 
-            # decomp_scale converts the decomposer's PHYSICAL output line
-            # integrals (cm⁻¹·cm) into the recon-chain scale that the
-            # FBP_CUDA path expects to recover Compton/PE in cm⁻¹.
-            # Same factor as sino_correction (= 1/self.scale = 10 for
-            # self.scale = 0.1).
+            # The decomposer's basis functions (Klein-Nishina, PE=e^-3)
+            # are defined for LAC in cm⁻¹.  Convert sinograms from
+            # self.scale units (mm⁻¹) to cm⁻¹ before decomposition.
             decomp_scale = 1.0 / self.scale if abs(self.scale - 1.0) > 1e-6 else 1.0
 
-            solver = decomposer_args['cdm_solver']
-            cdm_type = decomposer_args['cdm_type']
-
-            # ---- Audit fix (mirrors BHC scaling fix in ce652ed) ----------
-            # The decomposer's COMPTON_PE model fits A_p, A_c such that
-            # exp(-A_p·PE(E) - A_c·KN(E)) integrated over the spectrum
-            # matches the input -ln(I/I0).  Its model is calibrated for
-            # PHYSICAL line integrals (cm⁻¹·cm) — basis functions
-            # klein_nishina() and photoelectric() in lib/misc/ctlib.py are
-            # dimensionless.
-            #
-            # Previously we pre-multiplied the input by decomp_scale (=10),
-            # which pushed the model predictions into the saturated
-            # exp(-X) ≈ 0 regime for metal pixels (A_p·PE + A_c·KN > 30
-            # numerically) and produced garbage A_p, A_c fits there.
-            #
-            # Fix: feed physical sino to the decomposer; rescale the
-            # decomposer's PHYSICAL output by decomp_scale to put sino_c
-            # and sino_pe into the same units the recon chain expects
-            # (so FBP_CUDA recovers Compton/PE in cm⁻¹).
-
-            if solver == 'gpu' and nrows > 1:
-                # ---- Batched GPU path: all rows in a single GpuFit call ------
-                # GpuFit handles millions of independent fits efficiently.
-                # Stacking all rows into one call avoids nrows separate GPU
-                # kernel launches + data transfers.
-                self.logger.info(
-                    f"Decomposing {nrows} rows in a single batched GPU call")
-
-                # Reshape to (nbins*nrows, nangs) per 2D slice convention,
-                # then let decompose_dect_sinograms flatten internally.
-                nbins, _, nangs = self.data1.shape
-
-                # Temporarily override sino_shape to match the full 3D volume
-                orig_shape = cdm_sim.sino_shape
-                orig_npxls = cdm_sim.n_sino_pxls
-                cdm_sim.sino_shape = (nbins * nrows, nangs)
-                cdm_sim.n_sino_pxls = nbins * nrows * nangs
-
+            for i in range(nrows):
+                self.logger.info("Row %d:" % i)
                 cdm_sim.init_val = decomposer_args['init_val']
-                # Input: physical line integral (not pre-scaled by 10).
-                sino_pe_flat, sino_c_flat = \
+                # try:
+                sino_pe[:, i, :], sino_c[:, i, :] = \
                     cdm_sim.decompose_dect_sinograms(
-                        self.data1.reshape(nbins * nrows, nangs),
-                        self.data2.reshape(nbins * nrows, nangs),
-                        solver='gpu',
-                        type=cdm_type
+                        self.data1[:, i, :] * decomp_scale,
+                        self.data2[:, i, :] * decomp_scale,
+                        solver=decomposer_args['cdm_solver'],
+                        type=decomposer_args['cdm_type']
                     )
-
-                # Restore and reshape back to 3D, rescaling for the recon chain.
-                cdm_sim.sino_shape = orig_shape
-                cdm_sim.n_sino_pxls = orig_npxls
-                sino_pe = sino_pe_flat.reshape(
-                    nbins, nrows, nangs) * decomp_scale
-                sino_c = sino_c_flat.reshape(
-                    nbins, nrows, nangs) * decomp_scale
-
+                # except:
+                #     self.logger.info("GPufit error encountered")
                 torch.cuda.empty_cache()
-            else:
-                # ---- Row-by-row fallback (CPU / vec solver) ------------------
-                sino_pe = zeros_like(self.data1)
-                sino_c = zeros_like(self.data2)
-
-                for i in range(nrows):
-                    self.logger.info("Row %d:" % i)
-                    cdm_sim.init_val = decomposer_args['init_val']
-                    # Input: physical line integral (not pre-scaled by 10).
-                    pe_i, c_i = cdm_sim.decompose_dect_sinograms(
-                        self.data1[:, i, :],
-                        self.data2[:, i, :],
-                        solver=solver,
-                        type=cdm_type
-                    )
-                    # Rescale physical output to recon-chain scale.
-                    sino_pe[:, i, :] = pe_i * decomp_scale
-                    sino_c[:, i, :] = c_i * decomp_scale
 
             self.sino_c = sino_c.copy()
             self.sino_pe = sino_pe.copy()
@@ -1753,35 +1548,17 @@ class DEBISimPipeline(object):
                     bhc_correctors.append(bhc)
                     self.logger.info(
                         f"BHC LUT built: E_eff={bhc.e_eff:.1f} keV, "
-                        f"mu_mono={bhc.mu_mono:.4f} cm^-1")
+                        f"mu_mono={bhc.mu_mono:.4f} cm⁻¹")
             except Exception as e:
                 self.logger.warning(f"BHC initialization failed: {e}")
                 bhc_correctors = []
 
         def _apply_bhc(sino, spectrum_idx):
-            """Apply BHC to sinogram if corrector is available.
-
-            The BHC LUT is built in PHYSICAL cm⁻¹·cm line-integral units
-            and has a calibrated max around s_poly_max ≈ 9 (= ~50 cm of
-            water-equivalent attenuation).  The pipeline scales sino by
-            sino_correction (=10 for self.scale=0.1) for the recon chain's
-            unit-conversion, but if we apply that scale BEFORE BHC the
-            input lands ~10× above the LUT's calibrated range, which
-            clips every non-air material to the same LUT-max value and
-            destroys all material distinction (steel and water both end
-            up reconstructing as near-zero LAC).
-
-            Fix: feed BHC the unscaled (physical) sino, then rescale
-            the linearized output by sino_correction to match the
-            recon chain's expected magnitude.
-            """
+            """Apply BHC to sinogram if corrector is available."""
+            sino_cm = sino * sino_correction
             if spectrum_idx < len(bhc_correctors):
-                # BHC sees physical line integrals; output stays linear,
-                # so post-multiplying by sino_correction is dimensionally
-                # equivalent to the pre-scaled path (without clipping).
-                return bhc_correctors[spectrum_idx].correct(sino) \
-                       * sino_correction
-            return sino * sino_correction
+                return bhc_correctors[spectrum_idx].correct(sino_cm)
+            return sino_cm
 
         if self.xray_source_model['num_spectra']==2:
             sino1_corrected = _apply_bhc(self.data1, 0)
@@ -1840,8 +1617,9 @@ class DEBISimPipeline(object):
                     out_fname = os.path.join(self.f_loc['sino_dir'],
                                              fname % (img_suffixes[0]))
 
+                self.logger.info(f"Saving results to: {out_fname}")
                 self.sino_c = moveaxis(self.sino_c, -1, 0)
-                self._save_npz(out_fname, self.sino_c)
+                savez_compressed(out_fname, self.sino_c)
             del self.sino_c
 
             if self.save_de_sino:
@@ -1852,8 +1630,9 @@ class DEBISimPipeline(object):
                     out_fname = os.path.join(self.f_loc['sino_dir'],
                                              fname % (img_suffixes[1]))
 
+                self.logger.info(f"Saving results to: {out_fname}")
                 self.sino_pe = moveaxis(self.sino_pe, -1, 0)
-                self._save_npz(out_fname, self.sino_pe)
+                savez_compressed(out_fname, self.sino_pe)
             del self.sino_pe
 
         scale = self.scanner.recon_params['img_scale']
@@ -1890,9 +1669,9 @@ class DEBISimPipeline(object):
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'] % 1)
+                self.logger.info("Saving results to: "+out_fname)
 
-
-                self._save_output(out_fname, image_1)
+                save_fits_data_async(out_fname, image_1, self.compress_data)
 
                 image_2 *= scale
                 image_2 = (image_2 - mu_w['lac_2']) / mu_w['lac_2'] * 1000 + offset
@@ -1901,11 +1680,24 @@ class DEBISimPipeline(object):
                 # Save reconstructed images
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'] % 2)
-
-                self._save_output(out_fname, image_2)
+                self.logger.info("Saving results to: "+out_fname)
+                save_fits_data_async(out_fname, image_2, self.compress_data)
 
                 # Cache in memory so save_dicom_output() doesn't re-read from disk
                 self._recon_images_cache = [image_1, image_2]
+
+                # GIF encoding is pure I/O — dispatch to background thread
+                _gif_pool = _get_io_pool()
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
+                    self.gt_image_3d.cpu().numpy(), stride=5)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
+                    np.clip(image_1+1000, 0, 3500), stride=2)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%2),
+                    np.clip(image_2+1000, 0, 3500), stride=2)
+                self.logger.info("Dispatched GIF creation to background")
 
             elif self.xray_source_model['num_spectra'] == 1:
                 image_1 *= scale
@@ -1919,11 +1711,22 @@ class DEBISimPipeline(object):
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file']%1)
-
-                self._save_output(out_fname, image_1)
+                self.logger.info("Saving results to: "+out_fname)
+                save_fits_data_async(out_fname, image_1, self.compress_data)
 
                 # Cache in memory so save_dicom_output() doesn't re-read from disk
                 self._recon_images_cache = [image_1]
+
+                # GIF encoding is pure I/O — dispatch to background thread
+                _gif_pool = _get_io_pool()
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'gt_label_image.gif'),
+                    self.gt_image_3d.cpu().numpy(), stride=5)
+                _gif_pool.submit(create_gif,
+                    os.path.join(self.f_loc['gif_dir'], 'recon_image_%i.gif'%1),
+                    np.clip(image_1+1000, 0, 3500), stride=2)
+
+                self.logger.info("Dispatched GIF creation to background")
 
             if self.DECOMPOSER_FLAG:
                 if self.scanner.machine_geometry['scanner_name'] in (
@@ -1970,18 +1773,18 @@ class DEBISimPipeline(object):
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % img_suffixes[0])
-
-                self._save_output(out_fname, image_c)
+                self.logger.info("Saving results to: "+out_fname)
+                save_fits_data_async(out_fname, image_c, self.compress_data)
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % img_suffixes[1])
-
-                self._save_output(out_fname, image_pe)
+                self.logger.info("Saving results to: "+out_fname)
+                save_fits_data_async(out_fname, image_pe, self.compress_data)
 
                 out_fname = os.path.join(self.f_loc['image_dir'],
                                          self.f_loc['img_file'].replace('%i', '%s') % 'z')
-
-                self._save_output(out_fname, image_z)
+                self.logger.info("Saving results to: "+out_fname)
+                save_fits_data_async(out_fname, image_z, self.compress_data)
 
                 del image_c, image_pe, image_z, image_1, image_2
 
@@ -1993,8 +1796,8 @@ class DEBISimPipeline(object):
 
                     out_fname = os.path.join(self.f_loc['image_dir'],
                                              'recon_image_%s.fits.gz' % 'rho')
-    
-                    self._save_output(out_fname, image_rho)
+                    self.logger.info("Saving results to: "+out_fname)
+                    save_fits_data_async(out_fname, image_rho, self.compress_data)
 
             # Wait for all async FITS writes to complete before exiting
             flush_async_io()
@@ -2089,13 +1892,8 @@ class DEBISimPipeline(object):
         pixel_sz = mg.get('det_spacing_y', 1.0)
         slice_sz = mg.get('det_spacing_x', pixel_sz)
 
-        archive = self.archive if self.monolithic_output else None
-        # When archiving, pass a relative prefix so all DICOM arcnames
-        # are relative paths with forward slashes (e.g. images/dicom/...).
-        dicom_image_dir = (self._to_arcname(self.f_loc['image_dir'])
-                           if archive else self.f_loc['image_dir'])
         _save_dicom(
-            image_dir=dicom_image_dir,
+            image_dir=self.f_loc['image_dir'],
             recon_images=recon_images,
             gt_label_volume=gt_label,
             sf_obj_list=self.sf_obj_list,
@@ -2103,14 +1901,9 @@ class DEBISimPipeline(object):
             slice_thickness=float(slice_sz),
             scan_metadata=scan_metadata,
             mu_handler=self.mu,
-            archive=archive,
         )
-
-        if archive is not None:
-            self.logger.info("Archived DICOM output")
-        else:
-            dicom_dir = os.path.join(self.f_loc['image_dir'], 'dicom')
-            self.logger.info("DICOM output saved to %s" % dicom_dir)
+        self.logger.info("DICOM output with threat ROIs saved to %s" %
+                         os.path.join(self.f_loc['image_dir'], 'dicom'))
     # --------------------------------------------------------------------------
 
     def save_dect_ground_truth_images(self, images=['gt']):
@@ -2125,19 +1918,19 @@ class DEBISimPipeline(object):
         """
 
         if 'gt' in images:
-            self._save_output(self.f_loc['gt_image'],
-                           self.gt_image_3d.cpu().numpy().astype(STORAGE_DTYPE))
+            save_fits_data_async(self.f_loc['gt_image'],
+                           self.gt_image_3d.cpu().numpy().astype(STORAGE_DTYPE), self.compress_data)
 
-
+            self.logger.info("GT image saved as %s"%self.f_loc['gt_image'])
 
         if 'compton' in images:
             compton_image_file = os.path.join(self.f_loc['gt_dir'],
                                               'gt_compton_image.fits.gz')
 
-            self._save_output(compton_image_file,
-                           self.compton_image_3d.cpu().numpy())
+            save_fits_data_async(compton_image_file,
+                           self.compton_image_3d.cpu().numpy(), self.compress_data)
 
-
+            self.logger.info("Compton image saved as %s"%compton_image_file)
 
         if 'pe' in images:
             pe_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -2158,9 +1951,9 @@ class DEBISimPipeline(object):
                                                                                 'pe')]),
                                                  pe_image_3d)
 
-            self._save_output(pe_image_file, pe_image_3d.cpu().numpy())
+            save_fits_data_async(pe_image_file, pe_image_3d.cpu().numpy(), self.compress_data)
             del pe_image_3d
-
+            self.logger.info("PE image saved as %s"%pe_image_file)
 
         if 'zeff' in images:
             zeff_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -2181,9 +1974,9 @@ class DEBISimPipeline(object):
                                                                                 'z')]),
                                                  zeff_image_3d)
 
-            self._save_output(zeff_image_file, zeff_image_3d.cpu().numpy())
+            save_fits_data_async(zeff_image_file, zeff_image_3d.cpu().numpy(), self.compress_data)
             del zeff_image_3d
-
+            self.logger.info("Zeff image saved as %s"%zeff_image_file)
 
         if 'lac' in images:
             lac_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -2203,9 +1996,9 @@ class DEBISimPipeline(object):
                                                                                 'lac')]),
                                                  lac_1_image_3d)
 
-            self._save_output(lac_image_file, lac_image_3d.cpu().numpy())
+            save_fits_data_async(lac_image_file, lac_image_3d.cpu().numpy(), self.compress_data)
             del lac_image_3d
-
+            self.logger.info("LAC image saved as %s"%lac_image_file)
 
         if 'lac_1' in images:
             lac_1_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -2226,9 +2019,9 @@ class DEBISimPipeline(object):
                                                                                 'lac_1')]),
                                                  lac_1_image_3d)
 
-            self._save_output(lac_1_image_file, lac_1_image_3d.cpu().numpy())
+            save_fits_data_async(lac_1_image_file, lac_1_image_3d.cpu().numpy(), self.compress_data)
             del lac_1_image_3d
-
+            self.logger.info("LAC 1 image saved as %s"%lac_1_image_file)
 
         if 'lac_2' in images:
             lac_2_image_file = os.path.join(self.f_loc['gt_dir'],
@@ -2249,9 +2042,9 @@ class DEBISimPipeline(object):
                                                                                 'lac_2')]),
                                                  lac_2_image_3d)
 
-            self._save_output(lac_2_image_file, lac_2_image_3d.cpu().numpy())
+            save_fits_data_async(lac_2_image_file, lac_2_image_3d.cpu().numpy(), self.compress_data)
             del lac_2_image_3d
-
+            self.logger.info("LAC 2 image saved as %s"%lac_2_image_file)
 
         torch.cuda.empty_cache()   # single cleanup after all GT images saved
     # --------------------------------------------------------------------------

@@ -13,15 +13,14 @@ dependencies = [
     "scikit-learn",
     "brt",
     "scipy",
-    "astra-toolbox",
-    "pygpufit",
+    "astra-toolbox @ file:C:///Users/MBasa/PycharmProjects/debisim2/astra_toolbox-2.2.0-cp312-cp312-win_amd64.whl",
+    "pygpufit @ file:C:///Users/MBasa/PycharmProjects/debisim2/pygpufit-1.2.0-py2.py3-none-any.whl",
     "trimesh",
     "scipy-stubs~=1.17.1",
     "tqdm",
     "pydicom",
     "astropy",
-    "psutil",
-    "zstandard"
+    "psutil"
 ]
 
 [tool.uv.sources]
@@ -31,8 +30,6 @@ torch = [
 torchvision = [
     { index = "pytorch-cu130", marker = "sys_platform == 'win32'" }
 ]
-astra-toolbox = { path = "astra_toolbox-2.2.0-cp312-cp312-win_amd64.whl" }
-pygpufit = { path = "pygpufit-1.2.0-py2.py3-none-any.whl" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

@@ -552,24 +552,20 @@ class TestProjectionAnalytical:
                                                  cylinder_phantom):
         """Peak projection (ray through center) should equal 2μR.
 
-        Analytical: p(0) = 2 × μ × R_physical
-        where R_physical = R_pixels × pixel_size_mm.
-
-        With the geometry-fix that aligns vol_geom with proj_geom
-        physical units, ASTRA integrates in mm — projection values
-        are LAC (cm⁻¹) × path-length-in-mm, matching the textbook
-        Radon transform of the cylinder.
+        Analytical: p(0) = 2 × μ × R
+        where R is in physical units (pixels × pixel_size).
+        ASTRA works in voxel units internally, so R = radius_pixels.
         """
         vol, lac, radius_px = cylinder_phantom
-        pixel_size_mm = cylinder_scanner.machine_geometry['det_spacing_y']
         sino = cylinder_scanner.run_fwd_projector(vol)
         # sino shape: (det_rows, n_views, det_cols)
         # For a centered circle, peak projection is at the center detector
         center_det = sino.shape[2] // 2
         # Take the 0-degree view (view 0)
         peak_measured = sino[0, 0, center_det]
-        # Analytical: 2 * lac * physical_diameter = 2 * lac * R_px * pixel_size
-        peak_analytical = 2.0 * lac * radius_px * pixel_size_mm
+        # Analytical: 2 * lac * diameter_in_voxels
+        # ASTRA integrates in voxel units, so path length = 2*radius_pixels
+        peak_analytical = 2.0 * lac * radius_px
         ratio = peak_measured / peak_analytical if peak_analytical > 0 else 0
 
         print(f"\nProjection peak test:")
@@ -586,11 +582,9 @@ class TestProjectionAnalytical:
         """Projection profile should follow √(R²-d²) shape.
 
         Compare the measured profile against the analytical Radon transform
-        of a circle at several offsets from center.  With physical vol_geom,
-        both r and d are in physical mm units.
+        of a circle at several offsets from center.
         """
         vol, lac, radius_px = cylinder_phantom
-        pixel_size_mm = cylinder_scanner.machine_geometry['det_spacing_y']
         sino = cylinder_scanner.run_fwd_projector(vol)
         n_det = sino.shape[2]
         center = n_det // 2
@@ -602,11 +596,7 @@ class TestProjectionAnalytical:
             if d >= radius_px:
                 continue
             measured = sino[0, 0, center + d]
-            # Analytical Radon transform of a circle: 2*lac*sqrt(R²-d²),
-            # both R and d in PHYSICAL units (mm).
-            r_mm = radius_px * pixel_size_mm
-            d_mm = d * pixel_size_mm
-            analytical = 2.0 * lac * np.sqrt(r_mm ** 2 - d_mm ** 2)
+            analytical = 2.0 * lac * np.sqrt(radius_px ** 2 - d ** 2)
             if analytical > 0:
                 rel_err = abs(measured - analytical) / analytical
                 errors.append((d, measured, analytical, rel_err))

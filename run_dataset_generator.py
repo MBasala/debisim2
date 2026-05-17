@@ -72,18 +72,6 @@ if __name__ == '__main__':
                              'and remove the uncompressed directory to save disk space'
                         )
 
-    parser.add_argument('--monolithic_output',
-                        action='store_true',
-                        default=False,
-                        help='write all output into a single .tar.gz archive '
-                             'using a dedicated writer subprocess (faster I/O)')
-
-    parser.add_argument('--compression_threads',
-                        type=int,
-                        default=0,
-                        help='CPU threads for archive compression '
-                             '(0=auto, requires pigz for parallel gzip)')
-
     args = parser.parse_args()
 
     spec = config_loader.spec_from_file_location("config.params",
@@ -95,12 +83,8 @@ if __name__ == '__main__':
 
     config.params['num_bags'] = range(1, args.num_bags+1)
     config.params['num_workers'] = args.num_workers
-    # CLI flags override config only when explicitly passed
+    # CLI --compress_dicom overrides config only when explicitly passed
     if args.compress_dicom:
         config.params['compress_dicom'] = True
-    if args.monolithic_output:
-        config.params['monolithic_output'] = True
-    if args.compression_threads > 0:
-        config.params['compression_threads'] = args.compression_threads
     run_xray_dataset_generator(**config.params)
 # ----------------------------------------------------------------------------
