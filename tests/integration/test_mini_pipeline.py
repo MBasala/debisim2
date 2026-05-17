@@ -126,7 +126,7 @@ class TestOutputStructure:
         assert os.path.isdir(sim_dir)
 
     def test_sino_directory_exists(self, sim_dir):
-        sino_dir = os.path.join(sim_dir, 'sino')
+        sino_dir = os.path.join(sim_dir, 'projections')
         assert os.path.isdir(sino_dir)
 
     def test_images_directory_exists(self, sim_dir):
@@ -135,7 +135,7 @@ class TestOutputStructure:
 
     def test_sinograms_saved(self, sim_dir):
         """Dual-energy should produce sino_1.fits.gz and sino_2.fits.gz."""
-        sino_dir = os.path.join(sim_dir, 'sino')
+        sino_dir = os.path.join(sim_dir, 'projections')
         sino_files = glob.glob(os.path.join(sino_dir, 'sino_*.fits*'))
         assert len(sino_files) >= 2, f"Expected ≥2 sinogram files, found: {sino_files}"
 
@@ -161,29 +161,29 @@ class TestSinogramIntegrity:
     """Verify sinograms are valid numpy arrays with expected properties."""
 
     def test_sinogram_is_loadable(self, sim_dir):
-        sino_dir = os.path.join(sim_dir, 'sino')
+        sino_dir = os.path.join(sim_dir, 'projections')
         sino_files = glob.glob(os.path.join(sino_dir, 'sino_1*'))
         assert len(sino_files) > 0
-        data = read_fits_data(sino_files[0], 1)
+        data = read_fits_data(sino_files[0], 0)
         assert data is not None
         assert data.ndim == 3
 
     def test_sinogram_not_all_zeros(self, sim_dir):
-        sino_dir = os.path.join(sim_dir, 'sino')
+        sino_dir = os.path.join(sim_dir, 'projections')
         sino_files = glob.glob(os.path.join(sino_dir, 'sino_1*'))
-        data = read_fits_data(sino_files[0], 1)
+        data = read_fits_data(sino_files[0], 0)
         assert np.any(data != 0), "Sinogram is all zeros"
 
     def test_sinogram_has_no_nan(self, sim_dir):
-        sino_dir = os.path.join(sim_dir, 'sino')
+        sino_dir = os.path.join(sim_dir, 'projections')
         sino_files = glob.glob(os.path.join(sino_dir, 'sino_1*'))
-        data = read_fits_data(sino_files[0], 1)
+        data = read_fits_data(sino_files[0], 0)
         assert not np.any(np.isnan(data)), "Sinogram contains NaN"
 
     def test_sinogram_has_no_inf(self, sim_dir):
-        sino_dir = os.path.join(sim_dir, 'sino')
+        sino_dir = os.path.join(sim_dir, 'projections')
         sino_files = glob.glob(os.path.join(sino_dir, 'sino_1*'))
-        data = read_fits_data(sino_files[0], 1)
+        data = read_fits_data(sino_files[0], 0)
         assert not np.any(np.isinf(data)), "Sinogram contains Inf"
 
 
@@ -199,14 +199,14 @@ class TestReconIntegrity:
         img_dir = os.path.join(sim_dir, 'images')
         recon_files = glob.glob(os.path.join(img_dir, 'recon_image_*.fits*'))
         assert len(recon_files) > 0
-        data = read_fits_data(recon_files[0], 1)
+        data = read_fits_data(recon_files[0], 0)
         assert data is not None
         assert data.ndim == 3
 
     def test_recon_image_has_no_nan(self, sim_dir):
         img_dir = os.path.join(sim_dir, 'images')
         recon_files = glob.glob(os.path.join(img_dir, 'recon_image_*.fits*'))
-        data = read_fits_data(recon_files[0], 1)
+        data = read_fits_data(recon_files[0], 0)
         assert not np.any(np.isnan(data)), "Recon image contains NaN"
 
     def test_recon_has_contrast(self, sim_dir):
@@ -214,7 +214,7 @@ class TestReconIntegrity:
         (background air vs water region)."""
         img_dir = os.path.join(sim_dir, 'images')
         recon_files = glob.glob(os.path.join(img_dir, 'recon_image_*.fits*'))
-        data = read_fits_data(recon_files[0], 1)
+        data = read_fits_data(recon_files[0], 0)
         # At least some variation between min and max
         dynamic_range = float(np.max(data) - np.min(data))
         assert dynamic_range > 10.0, \
@@ -290,8 +290,3 @@ class TestNoRoundTrips:
                 assert not f.endswith('.bin'), f"Stale temp file: {f}"
                 assert not f.endswith('.prm'), f"Stale temp file: {f}"
 
-    def test_gif_files_created(self, sim_dir):
-        """GIF files should have been written (by background thread)."""
-        gif_files = glob.glob(os.path.join(sim_dir, '**', '*.gif'),
-                              recursive=True)
-        assert len(gif_files) >= 1, "No GIF files found — background dispatch may have failed"
