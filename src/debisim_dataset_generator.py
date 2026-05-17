@@ -81,8 +81,7 @@ def _process_single_bag(args_tuple):
     (bag_dir, scanner_init_args, xray_src_mdl, bag_creator_args,
      fwd_mdl_args, decomposer, decomposer_args, basis_fn,
      save_sino, recon_args, images_to_save, slicewise,
-     compress_data, dicom_output, compress_dicom,
-     monolithic_output, compression_threads) = payload
+     compress_data, dicom_output, compress_dicom) = payload
 
     # ---- Acquire a free GPU ------------------------------------------------
     gpu_id = gpu_queue.get()          # blocks until a GPU is available
@@ -118,9 +117,7 @@ def _process_single_bag(args_tuple):
             sim_path=bag_dir,
             scanner_model=scanner,
             xray_source_model=xray_src_mdl,
-            compress_data=compress_data,
-            monolithic_output=monolithic_output,
-            compression_threads=compression_threads,
+            compress_data=compress_data
         )
 
         simulator.logger.info("=" * 80)
@@ -155,21 +152,10 @@ def _process_single_bag(args_tuple):
 
         if dicom_output:
             simulator.save_dicom_output()
-            if compress_dicom and not monolithic_output:
+            if compress_dicom:
                 _compress_dicom_dir(simulator.f_loc['image_dir'],
                                     simulator.logger)
 
-        # Flush any pending async FITS writes (non-monolithic path) before
-        # the worker exits, so writes complete while the process is alive.
-        from lib.misc.util import flush_async_io
-        flush_async_io()
-
-        # Finalize a monolithic archive (flush + close writer thread)
-        if monolithic_output and simulator.archive is not None:
-            simulator.archive.close()
-
-        # Close all log handlers BEFORE rmtree — Windows holds file locks
-        _sim_dir_path = simulator.f_loc['simulation_dir']
         for handler in list(simulator.logger.handlers):
             try:
                 handler.flush()
@@ -180,24 +166,8 @@ def _process_single_bag(args_tuple):
             except Exception:
                 pass
             simulator.logger.removeHandler(handler)
-        for handler in list(simulator.scanner.logger.handlers):
-            try:
-                handler.flush()
-            except Exception:
-                pass
-            try:
-                handler.close()
-            except Exception:
-                pass
-            simulator.scanner.logger.removeHandler(handler)
         simulator.logger.propagate = False
         simulator.scanner.logger.propagate = False
-
-        # Now safe to remove staging directory (all file handles released)
-        if monolithic_output:
-            import shutil
-            if os.path.isdir(_sim_dir_path):
-                shutil.rmtree(_sim_dir_path)
 
         del simulator.logger
         del simulator
@@ -239,9 +209,7 @@ def run_xray_dataset_generator(num_bags,
                                fwd_mdl_args=None,
                                num_workers=1,
                                dicom_output=False,
-                               compress_dicom=False,
-                               monolithic_output=False,
-                               compression_threads=0
+                               compress_dicom=False
 ):
     """
     ---------------------------------------------------------------------------
@@ -343,8 +311,7 @@ def run_xray_dataset_generator(num_bags,
             (bag_dir, scanner_init_args, xray_src_mdl, bag_creator_args,
              fwd_mdl_args, decomposer, decomposer_args, basis_fn,
              save_sino, recon_args, images_to_save, slicewise,
-             compress_data, dicom_output, compress_dicom,
-             monolithic_output, compression_threads, gpu_queue)
+             compress_data, dicom_output, compress_dicom, gpu_queue)
             for bag_dir in bag_dirs
         ]
 
@@ -398,9 +365,8 @@ def run_xray_dataset_generator(num_bags,
             sim_path=bag_dir,
             scanner_model=scanner,
             xray_source_model=xray_src_mdl,
-            compress_data=compress_data,
-            monolithic_output=monolithic_output,
-            compression_threads=compression_threads,
+            compress_data=compress_data
+            # zwidth=scanner.recon_params['image_dims'][2]
         )
 
         simulator.logger.info("="*80)
@@ -422,7 +388,9 @@ def run_xray_dataset_generator(num_bags,
 
         f_loc = simulator.f_loc.copy()
 
-        if decomposer!='none':
+        if decomposer=='none':
+            pass
+        else:
 
             simulator.logger.info('\n'+'-'*50+"DECOMPOSER"+'-'*50+'\n')
 
@@ -440,20 +408,12 @@ def run_xray_dataset_generator(num_bags,
 
         if dicom_output:
             simulator.save_dicom_output()
-            if compress_dicom and not monolithic_output:
+            if compress_dicom:
                 _compress_dicom_dir(simulator.f_loc['image_dir'],
                                     simulator.logger)
 
-        # Flush any pending async FITS writes before cleanup
-        from lib.misc.util import flush_async_io
-        flush_async_io()
+        res = dict()
 
-        # Finalize monolithic archive (flush + close writer thread)
-        if monolithic_output and simulator.archive is not None:
-            simulator.archive.close()
-
-        # Close all log handlers BEFORE rmtree — Windows holds file locks
-        _sim_dir_path = simulator.f_loc['simulation_dir']
         for handler in list(simulator.logger.handlers):
             try:
                 handler.flush()
@@ -464,29 +424,13 @@ def run_xray_dataset_generator(num_bags,
             except Exception:
                 pass
             simulator.logger.removeHandler(handler)
-        for handler in list(simulator.scanner.logger.handlers):
-            try:
-                handler.flush()
-            except Exception:
-                pass
-            try:
-                handler.close()
-            except Exception:
-                pass
-            simulator.scanner.logger.removeHandler(handler)
+
         simulator.logger.propagate = False
         simulator.scanner.logger.propagate = False
-
-        # Now safe to remove staging directory (all file handles released)
-        if monolithic_output:
-            import shutil
-            if os.path.isdir(_sim_dir_path):
-                shutil.rmtree(_sim_dir_path)
 
         del simulator.logger
         del simulator
 
-        res = {}
         return res
     # -------------------------------------------------------------------------
 

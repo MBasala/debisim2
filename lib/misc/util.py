@@ -1,11 +1,4 @@
-import builtins
 import sys
-import io
-import subprocess
-import tarfile
-import time as _time
-import atexit as _atexit
-
 import numpy as np
 from numpy import *  # noqa: F401,F403 - intentional wildcard re-export
 from numpy.linalg import eigh
@@ -16,8 +9,6 @@ import scipy.misc as misc
 from concurrent.futures import ThreadPoolExecutor
 import threading
 
-import psutil
-
 from astropy.io import fits as pyfits
 from pydicom import uid
 from skimage.measure import regionprops
@@ -25,7 +16,9 @@ from skimage.transform import rescale
 
 from lib.__init__ import *
 from sys import stdout as stdout
+from lib.misc.multi_processor import *
 from PIL import Image
+import imageio
 
 
 class DicomCoordinateMapper:
@@ -278,16 +271,21 @@ def _get_io_pool():
     return _io_pool
 
 
-def submit_async_io(fn, *args, **kwargs):
-    """Submit a callable to the I/O thread pool and track its future.
-
-    Completed futures are pruned on each call; any exception from a
-    finished write is raised immediately so failures are not silently lost.
-
-    :returns: ``concurrent.futures.Future``
+def save_fits_data_async(file_path, out_image, compress=False):
     """
-    fut = _get_io_pool().submit(fn, *args, **kwargs)
+    Submit a FITS save to the background I/O thread pool.
+
+    The image array is copied before submission so the caller can safely
+    reuse or free the memory immediately.
+
+    :param file_path:   path to the fits file
+    :param out_image:   numpy array to save
+    :param compress:    whether to use FITS compression
+    """
+    data_copy = out_image.copy()
+    fut = _get_io_pool().submit(save_fits_data, file_path, data_copy, compress)
     with _io_lock:
+        # Prune completed futures — surface any write failures immediately
         surviving = []
         for f in _io_futures:
             if f.done():
@@ -298,26 +296,11 @@ def submit_async_io(fn, *args, **kwargs):
                 surviving.append(f)
         surviving.append(fut)
         _io_futures[:] = surviving
-    return fut
-
-
-def save_fits_data_async(file_path, out_image, compress=False):
-    """Submit a FITS save to the background I/O thread pool.
-
-    The image array is copied before submission so the caller can safely
-    reuse or free the memory immediately.
-
-    :param file_path:   path to the fits file
-    :param out_image:   numpy array to save
-    :param compress:    whether to use FITS compression
-    """
-    data_copy = out_image.copy()
-    submit_async_io(save_fits_data, file_path, data_copy, compress)
 
 
 def flush_async_io():
-    """Block until all pending async I/O has completed.
-
+    """
+    Block until all pending async FITS writes have completed.
     Call this before the pipeline exits or before reading back saved files.
     Raises the first exception encountered, if any.
     """
@@ -330,431 +313,15 @@ def flush_async_io():
 # -----------------------------------------------------------------------------
 
 
-# =============================================================================
-# Monolithic tar.gz archive — threaded writer with pigz for parallel gzip
-# =============================================================================
-
-_ARCHIVE_SENTINEL = None  # sentinel value to signal writer shutdown
-
-
-def _try_zstd_stream(archive_path, threads):
-    """Open a streaming zstd writer if the ``zstandard`` package is
-    available.  Returns ``(out_fh, stream_writer)`` pair or ``(None, None)``.
-
-    zstd is 5-15× faster than gzip at similar compression ratios and has
-    native multi-thread support — by far the best choice when available.
-    """
-    try:
-        import zstandard
-    except ImportError:
-        return None, None
-    try:
-        # Re-suffix to .zst so consumers know the format
-        if not archive_path.endswith('.zst'):
-            archive_path = archive_path[:-3] + '.zst' \
-                if archive_path.endswith('.gz') else archive_path + '.zst'
-        # zstd level 3 is the sweet spot: ~gzip-6 ratio at ~3-5× speed
-        cctx = zstandard.ZstdCompressor(
-            level=3, threads=(threads if threads > 0 else -1))
-        out_fh = open(archive_path, 'wb')
-        stream = cctx.stream_writer(out_fh)
-        return (out_fh, stream), archive_path
-    except Exception:
-        return None, None
-
-
-def _try_pigz(archive_path, threads):
-    """Start a pigz subprocess for parallel gzip.  Returns Popen or None."""
-    try:
-        cmd = ['pigz', '-c']
-        if threads > 0:
-            cmd += ['-p', str(threads)]
-        out_fh = open(archive_path, 'wb')
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=out_fh)
-        proc._out_fh = out_fh          # prevent GC closing file handle
-        return proc
-    except FileNotFoundError:
-        return None
-
-
-def _archive_writer_loop(q, archive_path, threads, written_event,
-                         written_count_lock, written_count_list,
-                         final_path_holder):
-    """Writer thread entry point — chooses the fastest available compressor.
-
-    Tries in order: zstd (multi-thread, ~10-20× faster than gzip), pigz
-    (multi-thread gzip), then Python tarfile w:gz (single-thread fallback).
-
-    Uses a threading.Thread (not a subprocess) so that data passes
-    by reference — no pickling, no pipe buffer limits for multi-GB
-    FITS arrays.  zstd/zlib/pigz all release the GIL during compression,
-    so GPU work runs concurrently.
-
-    Parameters
-    ----------
-    q : queue.Queue
-        Thread-safe queue of (arcname, data_bytes) tuples.
-    archive_path : str
-        Requested output path (suffix may be rewritten to .tar.zst).
-    threads : int
-        Compression threads (0 = auto).
-    written_event : threading.Event
-        Set after each item is written — used for RAM-pressure drain.
-    written_count_lock : threading.Lock
-        Protects written_count_list.
-    written_count_list : list[int]
-        Single-element list holding the write count (mutable container).
-    final_path_holder : list[str]
-        Single-element list — writer records the actual path used here so
-        the caller can find the output (in case the suffix changed).
-    """
-    pigz_proc = None
-    tar = None
-    zstd_pair = None     # (out_fh, stream_writer) when zstd path is taken
-    actual_path = archive_path
-    try:
-        # ----- preferred: zstd ------------------------------------------------
-        zstd_result, zstd_path = _try_zstd_stream(archive_path, threads)
-        if zstd_result is not None:
-            zstd_pair = zstd_result
-            actual_path = zstd_path
-            tar = tarfile.open(mode='w|', fileobj=zstd_pair[1])
-        else:
-            # ----- fallback: pigz subprocess ---------------------------------
-            pigz_proc = _try_pigz(archive_path, threads)
-            if pigz_proc is not None:
-                tar = tarfile.open(mode='w|', fileobj=pigz_proc.stdin)
-            else:
-                # ----- last resort: single-thread Python gzip ----------------
-                tar = tarfile.open(archive_path, 'w:gz', compresslevel=6)
-
-        final_path_holder[0] = actual_path
-
-        while True:
-            item = q.get()
-            if item is _ARCHIVE_SENTINEL:
-                break
-            arcname, data = item
-            info = tarfile.TarInfo(name=arcname)
-            info.size = len(data)
-            info.mtime = int(_time.time())
-            tar.addfile(info, io.BytesIO(data))
-            # Update progress (thread-safe via lock)
-            with written_count_lock:
-                written_count_list[0] += 1
-            written_event.set()
-    except Exception:
-        pass  # partial archive is still valid tar
-    finally:
-        if tar is not None:
-            try:
-                tar.close()
-            except Exception:
-                pass
-        if zstd_pair is not None:
-            try:
-                zstd_pair[1].close()   # flush + finalize zstd stream
-                zstd_pair[0].close()   # close underlying file
-            except Exception:
-                pass
-        if pigz_proc is not None:
-            try:
-                pigz_proc.stdin.close()
-                pigz_proc.wait(timeout=30)
-            except Exception:
-                pass
-
-
-# -----------------------------------------------------------------------------
-# Serializer thread pool — moves Python serialization off the main thread.
-# Items submitted as (arcname, kind, payload) where:
-#   kind='fits'   -> payload = (array, compress_bool)
-#   kind='npz'    -> payload = dict of arrays
-#   kind='dicom'  -> payload = pydicom Dataset
-#   kind='pickle' -> payload = arbitrary picklable object
-#   kind='raw'    -> payload = bytes (already serialized)
-# Workers convert payload -> bytes and push (arcname, bytes) to the writer
-# queue.  Backpressure from the writer queue propagates naturally.
-# -----------------------------------------------------------------------------
-
-def _serialize_item(kind, payload):
-    """Convert a payload into bytes ready for the writer queue."""
-    buf = io.BytesIO()
-    if kind == 'raw':
-        return payload
-    elif kind == 'fits':
-        array, compress = payload
-        hdu = (pyfits.CompImageHDU(array, pyfits.Header()) if compress
-               else pyfits.PrimaryHDU(array, pyfits.Header()))
-        hdu.writeto(buf)
-    elif kind == 'npz':
-        # When destined for an archive, the outer compressor already
-        # handles compression — use savez (uncompressed) to avoid wasting
-        # CPU compressing twice.
-        np.savez(buf, **payload)
-    elif kind == 'dicom':
-        payload.save_as(buf)
-    elif kind == 'pickle':
-        pickle.dump(payload, buf, protocol=pickle.HIGHEST_PROTOCOL)
-    else:
-        raise ValueError(f"Unknown serializer kind: {kind!r}")
-    return buf.getvalue()
-
-
-def _serializer_loop(in_q, out_q, written_lock, written_count_list,
-                     written_event):
-    """Serializer thread entry point.
-
-    Pulls (arcname, kind, payload) from ``in_q``, calls ``_serialize_item``
-    (which can take 10-100 ms for big FITS / many-element DICOM), and
-    pushes (arcname, bytes) to ``out_q`` for the writer thread.
-
-    Multiple of these can run in parallel — pydicom/numpy/astropy release
-    the GIL during their hot inner loops (memcpy, zlib, etc.), so CPU
-    cores are actually utilized.
-    """
-    while True:
-        item = in_q.get()
-        if item is _ARCHIVE_SENTINEL:
-            # Forward sentinel to writer once all serializers exit
-            break
-        arcname, kind, payload = item
-        try:
-            data = _serialize_item(kind, payload)
-            out_q.put((arcname, data))
-        except Exception:
-            # Drop the failed item but keep the pipeline alive
-            with written_lock:
-                written_count_list[0] += 1
-            written_event.set()
-
-
-class MonolithicArchive:
-    """RAM-aware streaming archive writer with parallel serialization.
-
-    Data flow (two-stage pipeline)::
-
-        main thread:    add_fits/npz/dicom/pickle  →  serializer queue
-                        (immediate return — no serialization on main)
-
-        serializer pool (N threads):
-                        in_q  →  pydicom/astropy/numpy serialize  →  out_q
-
-        writer thread:  out_q  →  tarfile  →  zstd (preferred) /
-                                              pigz / gzip  →  disk
-
-    Compressor preference: zstd (10-20× faster than gzip) → pigz (multi-
-    thread gzip) → Python tarfile w:gz (single-thread fallback).  Writer
-    auto-picks the fastest available without user intervention.
-
-    Serializer pool offloads slow Python serialization (especially
-    pydicom which is ~Python-level per DataElement) from the main thread,
-    so the compute pipeline isn't blocked.  Workers run in parallel and
-    benefit from GIL releases inside the underlying libraries.
-
-    Inner-compression (savez_compressed, CompImageHDU) is intentionally
-    bypassed when going into an archive: the outer compressor already
-    compresses, so doubling up only wastes CPU.
-
-    Synchronization occurs only when:
-      1. Available RAM drops below threshold — main blocks until the
-         writer drains enough items.
-      2. ``close()`` is called at pipeline end.
-    """
-
-    def __init__(self, archive_path, compression_threads=0,
-                 ram_limit_fraction=0.5, logger=None,
-                 serializer_workers=None):
-        self._archive_path = archive_path
-        self._ram_limit = ram_limit_fraction
-        self._logger = logger
-
-        # Progress tracking (thread-safe)
-        self._written_event = threading.Event()
-        self._written_lock = threading.Lock()
-        self._written_count = [0]   # mutable container shared with writer
-        self._enqueued_count = 0
-        self._total_enqueued_bytes = 0
-
-        # Writer thread sets final archive path here (may differ from
-        # requested if zstd path is chosen: .tar.gz -> .tar.zst)
-        self._final_path_holder = [archive_path]
-
-        # Two-stage pipeline queues
-        import queue
-        self._serializer_queue = queue.Queue()   # main thread -> serializers
-        self._writer_queue = queue.Queue()       # serializers -> writer
-
-        # Number of serializer workers.  Default: half the CPUs, capped
-        # to avoid contention with the compute pipeline.
-        if serializer_workers is None:
-            try:
-                cpu = os.cpu_count() or 4
-            except Exception:
-                cpu = 4
-            serializer_workers = builtins.max(2, builtins.min(4, cpu // 2))
-        self._n_serializers = serializer_workers
-
-        # Writer thread
-        self._writer = threading.Thread(
-            target=_archive_writer_loop,
-            args=(self._writer_queue, archive_path, compression_threads,
-                  self._written_event, self._written_lock,
-                  self._written_count, self._final_path_holder),
-            daemon=True,
-            name='archive-writer',
-        )
-        self._writer.start()
-
-        # Serializer pool
-        self._serializers = [
-            threading.Thread(
-                target=_serializer_loop,
-                args=(self._serializer_queue, self._writer_queue,
-                      self._written_lock, self._written_count,
-                      self._written_event),
-                daemon=True,
-                name=f'archive-serializer-{i}',
-            )
-            for i in range(self._n_serializers)
-        ]
-        for t in self._serializers:
-            t.start()
-
-    # ---- public API: hand off to serializer pool (non-blocking) ---------
-
-    def add_fits(self, arcname, array, compress=False):
-        """Submit a numpy array for FITS serialization + archiving.
-
-        ``compress`` defaults to False because the outer zstd/gzip layer
-        already compresses; using CompImageHDU on top doubles up CPU
-        with no size benefit.
-        """
-        # Defensive copy: caller may free the array right after returning
-        self._submit(arcname, 'fits', (array, compress),
-                     estimated_bytes=array.nbytes)
-
-    def add_npz(self, arcname, **arrays):
-        """Submit numpy arrays for .npz serialization + archiving.
-
-        Always uses uncompressed savez — the archive layer compresses.
-        """
-        est = builtins.sum(a.nbytes for a in arrays.values()) if arrays else 0
-        self._submit(arcname, 'npz', arrays, estimated_bytes=est)
-
-    def add_dicom(self, arcname, dataset):
-        """Submit a pydicom Dataset for serialization + archiving."""
-        # pydicom Dataset doesn't expose nbytes; estimate from PixelData
-        est = 0
-        try:
-            pd = getattr(dataset, 'PixelData', b'')
-            est = len(pd) if pd else 4096
-        except Exception:
-            est = 4096
-        self._submit(arcname, 'dicom', dataset, estimated_bytes=est)
-
-    def add_pickle(self, arcname, obj):
-        """Submit an object for pickle serialization + archiving."""
-        # Conservative estimate; refined when actual bytes are produced
-        self._submit(arcname, 'pickle', obj, estimated_bytes=64 * 1024)
-
-    def add_raw(self, arcname, data_bytes):
-        """Enqueue pre-serialized bytes (bypasses serializer pool)."""
-        # Raw bytes don't need serialization — push straight to writer
-        self._writer_queue.put((arcname, data_bytes))
-        self._enqueued_count += 1
-        self._total_enqueued_bytes += len(data_bytes)
-        if self._ram_pressure():
-            self._wait_for_writer_drain()
-
-    # ---- internal: submit + backpressure --------------------------------
-
-    def _submit(self, arcname, kind, payload, estimated_bytes=0):
-        """Submit work to the serializer pool. Block only if RAM is tight.
-
-        The main thread returns immediately — serialization happens on
-        worker threads concurrent with compute work.
-        """
-        self._serializer_queue.put((arcname, kind, payload))
-        self._enqueued_count += 1
-        # estimated_bytes is approximate but good enough for RAM pressure
-        self._total_enqueued_bytes += estimated_bytes
-
-        if self._ram_pressure():
-            self._wait_for_writer_drain()
-
-    def _ram_pressure(self):
-        """True if estimated in-flight bytes exceed available RAM limit."""
-        avail = psutil.virtual_memory().available
-        return self._inflight_bytes_estimate() > avail * self._ram_limit
-
-    def _inflight_bytes_estimate(self):
-        """Estimate bytes still in flight (not yet written to disk)."""
-        with self._written_lock:
-            written = self._written_count[0]
-        pending = builtins.max(0, self._enqueued_count - written)
-        if self._enqueued_count == 0:
-            return 0
-        avg_size = self._total_enqueued_bytes / self._enqueued_count
-        return avg_size * pending
-
-    def _wait_for_writer_drain(self):
-        """Block until the writer has processed enough items to relieve
-        RAM pressure.  This is the ONLY sync point during normal operation.
-        """
-        if self._logger:
-            est = self._inflight_bytes_estimate()
-            self._logger.info(
-                f"MonolithicArchive: RAM pressure — waiting for writer "
-                f"(in-flight ~{est / 1e9:.1f} GB)")
-        while self._ram_pressure():
-            self._written_event.wait(timeout=0.1)
-            self._written_event.clear()
-
-    # ---- lifecycle ------------------------------------------------------
-
-    @property
-    def path(self):
-        """Actual on-disk archive path.  May differ from the path passed
-        to __init__ if the writer chose a different compressor (e.g.
-        zstd renames .tar.gz → .tar.zst)."""
-        return self._final_path_holder[0]
-
-    def close(self):
-        """Signal serializers, then writer to finish; wait for completion."""
-        # Send one sentinel per serializer; they exit and the writer drains
-        # whatever is left in writer_queue.  After all serializers exit, the
-        # writer needs its own sentinel.
-        for _ in range(self._n_serializers):
-            self._serializer_queue.put(_ARCHIVE_SENTINEL)
-        for t in self._serializers:
-            t.join(timeout=300)
-        self._writer_queue.put(_ARCHIVE_SENTINEL)
-        self._writer.join(timeout=300)
-
-        # The writer may have written to a different path (e.g. .tar.zst
-        # if zstd was available).  Surface the actual path back.
-        actual_path = self._final_path_holder[0]
-        self._archive_path = actual_path
-        if self._logger and os.path.exists(actual_path):
-            size_mb = os.path.getsize(actual_path) / 1e6
-            self._logger.info(
-                f"Archive written: {actual_path} ({size_mb:.1f} MB)")
-
-
-# =============================================================================
-
-
 def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
                       study_description='Simulated CT',
                       series_description='Recon', series_number=1,
                       pixel_spacing=(1.0, 1.0), slice_thickness=1.0,
-                      scan_metadata=None, archive=None):
+                      scan_metadata=None):
     """
     Save a 3D numpy array as a DICOM CT image series (one .dcm per slice).
 
-    :param output_dir:  directory to write .dcm files into (also used as
-                        archive prefix when archive is set)
+    :param output_dir:  directory to write .dcm files into
     :param volume_3d:   3D numpy array (H x W x D), values in HU
     :param patient_id:  DICOM PatientID
     :param study_description:  DICOM StudyDescription
@@ -767,28 +334,22 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
         det_row_count, det_col_count, sens_spacing_x, sens_spacing_y,
         gantry_diameter, num_views, kVp, dosage, recon_algo,
         image_dims, fov, anode_angle
-    :param archive:    optional MonolithicArchive — when set, slices are
-                       serialized to bytes and dispatched via archive.add_raw()
-                       instead of writing to disk
     :returns: dict with keys study_uid, series_uid, frame_uid, sop_uids
     """
     import datetime
-    import copy as _copy
     from pydicom.dataset import Dataset, FileDataset
 
     if scan_metadata is None:
         scan_metadata = {}
 
-    if archive is None:
-        os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     study_uid = uid.generate_uid()
     series_uid = uid.generate_uid()
     frame_uid = uid.generate_uid()
-    # Generate all SOP UIDs up front; cheaper than one per loop iteration
-    num_slices = volume_3d.shape[2]
-    sop_uids = [uid.generate_uid() for _ in range(num_slices)]
+    sop_uids = []
 
+    num_slices = volume_3d.shape[2]
     now = datetime.datetime.now()
     date_str = now.strftime('%Y%m%d')
     time_str = now.strftime('%H%M%S.%f')
@@ -817,151 +378,153 @@ def save_dicom_series(output_dir, volume_3d, patient_id='DEBISim',
     spectra_files = scan_metadata.get('spectra_files', [])
     img_scale = scan_metadata.get('img_scale', '')
 
-    # ---- Build a TEMPLATE Dataset once with all series-invariant fields ----
-    # All metadata that is constant across slices (patient, study, series,
-    # scanner geometry, DECT tags, ...) goes here.  Per-slice we only patch
-    # the few fields that actually vary: SOPInstanceUID, InstanceNumber,
-    # ImagePositionPatient, SliceLocation, PixelData, Rows, Columns, and
-    # file_meta.MediaStorageSOPInstanceUID.
-    template = FileDataset('template.dcm', {}, preamble=b'\x00' * 128)
-
-    template.SOPClassUID = '1.2.840.10008.5.1.4.1.1.2'  # CT Image Storage
-    template.StudyInstanceUID = study_uid
-    template.SeriesInstanceUID = series_uid
-    template.FrameOfReferenceUID = frame_uid
-
-    template.PatientID = patient_id
-    template.PatientName = patient_id
-
-    template.StudyDate = date_str
-    template.StudyTime = time_str
-    template.StudyDescription = study_description
-    template.AccessionNumber = ''
-    template.ReferringPhysicianName = ''
-
-    template.Modality = 'CT'
-    template.SeriesDescription = series_description
-    template.SeriesNumber = series_number
-
-    template.Manufacturer = 'DEBISim2'
-    template.InstitutionName = 'DEBISim2 Simulation'
-    template.StationName = str(scanner_name)
-    template.ManufacturerModelName = str(scanner_name)
-    template.SoftwareVersions = 'DEBISim2 1.2.0'
-
-    if kvp != '':
-        template.KVP = str(kvp)
-    if dosage != '':
-        n_v = int(num_views) if num_views != '' else 1
-        mAs = float(dosage) / (n_v if n_v > 0 else 1)
-        template.XRayTubeCurrent = str(int(round(mAs)))
-        template.Exposure = f'{float(dosage):.0f}'
-        template.ExposureInuAs = int(float(dosage))
-    if src_to_iso != '':
-        template.DistanceSourceToPatient = f'{float(src_to_iso):.1f}'
-    if src_to_det != '' and src_to_iso != '':
-        template.DistanceSourceToDetector = \
-            f'{float(src_to_iso) + float(src_to_det):.1f}'
-    if gantry_diam != '':
-        template.DataCollectionDiameter = f'{float(gantry_diam):.1f}'
-    if fov != '':
-        template.ReconstructionDiameter = f'{float(fov):.1f}'
-    elif gantry_diam != '':
-        template.ReconstructionDiameter = f'{float(gantry_diam):.1f}'
-
-    if det_rows != '':
-        template.NumberOfDetectorRows = int(det_rows)
-    if det_cols != '':
-        template.NumberOfDetectorColumns = int(det_cols)
-
-    template.ConvolutionKernel = str(recon_algo).upper()
-    template.FilterType = 'RAM-LAK'
-    template.ContentDate = date_str
-
-    _geom_to_dicom = {'PARALLEL': 'SEQUENCED', 'CONE': 'SPIRAL',
-                      'FANBEAM': 'SEQUENCED'}
-    template.AcquisitionType = _geom_to_dicom.get(
-        str(geometry).upper(), 'SEQUENCED')
-    template.ScanOptions = str(scan_type).upper()
-    template.GantryDetectorTilt = '0.0'
-    template.RotationDirection = 'CW'
-    template.TableHeight = '0.0'
-
-    if num_views != '':
-        template.NumberOfProjections = int(num_views)
-    if view_range != '':
-        template.ScanArc = f'{float(view_range):.1f}'
-
-    template.SpacingBetweenSlices = str(slice_thickness)
-
-    if num_spectra > 1:
-        template.add_new([0x0009, 0x0010], 'LO', 'DEBISim2_DECT')
-        template.add_new([0x0009, 0x1001], 'IS', str(num_spectra))
-        if spectra_files:
-            template.add_new([0x0009, 0x1002], 'LO',
-                             ', '.join(spectra_files))
-        if dosage_list:
-            template.add_new([0x0009, 0x1003], 'LO',
-                             ', '.join(f'{d:.0f}' for d in dosage_list))
-        if img_scale != '':
-            template.add_new([0x0009, 0x1004], 'DS',
-                             f'{float(img_scale):.6f}')
-
-    template.WindowCenter = '40'
-    template.WindowWidth = '400'
-
-    # Coordinate transform tags (constant for the whole series)
-    coord = DicomCoordinateMapper(pixel_spacing, slice_thickness)
-    dicom_tags = coord.dicom_tags()
-    template.ImageOrientationPatient = dicom_tags['ImageOrientationPatient']
-    template.PixelSpacing = dicom_tags['PixelSpacing']
-    template.SliceThickness = dicom_tags['SliceThickness']
-
-    template.SamplesPerPixel = 1
-    template.PhotometricInterpretation = 'MONOCHROME2'
-    template.BitsAllocated = 16
-    template.BitsStored = 16
-    template.HighBit = 15
-    template.PixelRepresentation = 1  # signed
-    template.RescaleIntercept = '0'
-    template.RescaleSlope = '1'
-    template.RescaleType = 'HU'
-
-    # File Meta template — SOPInstanceUID is patched per slice
-    template.file_meta = Dataset()
-    template.file_meta.MediaStorageSOPClassUID = template.SOPClassUID
-    template.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'
-    template.is_little_endian = True
-    template.is_implicit_VR = False
-
-    # ---- Per-slice: deepcopy template + patch only the varying fields -----
-    # Deepcopy is ~5-10× faster than building from scratch.  Serialization
-    # is offloaded to the archive's serializer pool (parallel across cores).
     for z in range(num_slices):
-        ds = _copy.deepcopy(template)
+        sop_uid = uid.generate_uid()
+        sop_uids.append(sop_uid)
 
-        ds.SOPInstanceUID = sop_uids[z]
+        fname = os.path.join(output_dir, f'slice_{z:04d}.dcm')
+        ds = FileDataset(fname, {}, preamble=b'\x00' * 128)
+
+        # --- SOP / Study / Series UIDs ---
+        ds.SOPClassUID = '1.2.840.10008.5.1.4.1.1.2'  # CT Image Storage
+        ds.SOPInstanceUID = sop_uid
+        ds.StudyInstanceUID = study_uid
+        ds.SeriesInstanceUID = series_uid
+        ds.FrameOfReferenceUID = frame_uid
+
+        # --- Patient Module ---
+        ds.PatientID = patient_id
+        ds.PatientName = patient_id
+
+        # --- General Study Module ---
+        ds.StudyDate = date_str
+        ds.StudyTime = time_str
+        ds.StudyDescription = study_description
+        ds.AccessionNumber = ''
+        ds.ReferringPhysicianName = ''
+
+        # --- General Series Module ---
+        ds.Modality = 'CT'
+        ds.SeriesDescription = series_description
+        ds.SeriesNumber = series_number
         ds.InstanceNumber = z + 1
+
+        # --- General Equipment Module ---
+        ds.Manufacturer = 'DEBISim2'
+        ds.InstitutionName = 'DEBISim2 Simulation'
+        ds.StationName = str(scanner_name)
+        ds.ManufacturerModelName = str(scanner_name)
+        ds.SoftwareVersions = 'DEBISim2 1.2.0'
+
+        # --- CT Image Module (scan acquisition parameters) ---
+        if kvp != '':
+            ds.KVP = str(kvp)
+        if dosage != '':
+            # Dosage is in photon counts — store as Exposure (mAs equivalent).
+            # XRayTubeCurrent is mA; for simulation, report dosage in a
+            # meaningful way: photon count goes into Exposure, mA is left
+            # proportional (dosage / n_views approximates mAs).
+            n_v = int(num_views) if num_views != '' else 1
+            mAs = float(dosage) / (n_v if n_v > 0 else 1)
+            ds.XRayTubeCurrent = str(int(round(mAs)))
+            ds.Exposure = f'{float(dosage):.0f}'
+            ds.ExposureInuAs = int(float(dosage))  # total photon count
+        if src_to_iso != '':
+            ds.DistanceSourceToPatient = f'{float(src_to_iso):.1f}'
+        if src_to_det != '' and src_to_iso != '':
+            ds.DistanceSourceToDetector = f'{float(src_to_iso) + float(src_to_det):.1f}'
+        if gantry_diam != '':
+            ds.DataCollectionDiameter = f'{float(gantry_diam):.1f}'
+        if fov != '':
+            ds.ReconstructionDiameter = f'{float(fov):.1f}'
+        elif gantry_diam != '':
+            ds.ReconstructionDiameter = f'{float(gantry_diam):.1f}'
+
+        # Detector geometry
+        if det_rows != '':
+            ds.NumberOfDetectorRows = int(det_rows)
+        if det_cols != '':
+            ds.NumberOfDetectorColumns = int(det_cols)
+
+        # Reconstruction parameters
+        ds.ConvolutionKernel = str(recon_algo).upper()
+        ds.FilterType = 'RAM-LAK'
+        ds.ContentDate = date_str
+
+        # Acquisition geometry — map DEBISim geometry names to valid DICOM values
+        _geom_to_dicom = {'PARALLEL': 'SEQUENCED', 'CONE': 'SPIRAL',
+                          'FANBEAM': 'SEQUENCED'}
+        ds.AcquisitionType = _geom_to_dicom.get(
+            str(geometry).upper(), 'SEQUENCED')
+        ds.ScanOptions = str(scan_type).upper()
+        ds.GantryDetectorTilt = '0.0'
+        ds.RotationDirection = 'CW'
+        ds.TableHeight = '0.0'
+
+        # Angular sampling
+        if num_views != '':
+            ds.NumberOfProjections = int(num_views)
+        if view_range != '':
+            ds.ScanArc = f'{float(view_range):.1f}'
+
+        # Spacing between slices (DICOM viewers need this for contiguous check)
+        ds.SpacingBetweenSlices = str(slice_thickness)
+
+        # Dual-energy metadata — store as private tags so downstream
+        # algorithms can detect DECT and find the companion series.
+        if num_spectra > 1:
+            ds.add_new([0x0009, 0x0010], 'LO', 'DEBISim2_DECT')
+            ds.add_new([0x0009, 0x1001], 'IS', str(num_spectra))
+            if spectra_files:
+                ds.add_new([0x0009, 0x1002], 'LO',
+                           ', '.join(spectra_files))
+            if dosage_list:
+                ds.add_new([0x0009, 0x1003], 'LO',
+                           ', '.join(f'{d:.0f}' for d in dosage_list))
+            if img_scale != '':
+                ds.add_new([0x0009, 0x1004], 'DS', f'{float(img_scale):.6f}')
+
+        # Window center/width for typical CT display
+        ds.WindowCenter = '40'
+        ds.WindowWidth = '400'
+
+        # --- Image Pixel Module ---
+        # All coordinate transforms are handled by DicomCoordinateMapper
+        # to keep pixel data, IOP, and contour generation consistent.
+        coord = DicomCoordinateMapper(pixel_spacing, slice_thickness)
+        dicom_tags = coord.dicom_tags()
         ds.ImagePositionPatient = coord.image_position_patient(z)
+        ds.ImageOrientationPatient = dicom_tags['ImageOrientationPatient']
+        ds.PixelSpacing = dicom_tags['PixelSpacing']
+        ds.SliceThickness = dicom_tags['SliceThickness']
         ds.SliceLocation = str(z * slice_thickness)
-        ds.file_meta.MediaStorageSOPInstanceUID = sop_uids[z]
+
+        ds.SamplesPerPixel = 1
+        ds.PhotometricInterpretation = 'MONOCHROME2'
+        ds.BitsAllocated = 16
+        ds.BitsStored = 16
+        ds.HighBit = 15
+        ds.PixelRepresentation = 1  # signed
+        ds.RescaleIntercept = '0'
+        ds.RescaleSlope = '1'
+        ds.RescaleType = 'HU'
 
         vol_slice = volume_3d[:, :, z]
         rows, cols = coord.pixel_rows_cols(vol_slice)
         ds.Rows = rows
         ds.Columns = cols
-        ds.PixelData = coord.volume_slice_to_pixels(vol_slice).tobytes()
+        pixel_data = coord.volume_slice_to_pixels(vol_slice)
+        ds.PixelData = pixel_data.tobytes()
 
-        slice_name = f'slice_{z:04d}.dcm'
-        fname = os.path.join(output_dir, slice_name) if archive is None \
-            else f'{output_dir}/{slice_name}'
+        # --- File Meta ---
+        ds.file_meta = Dataset()
+        ds.file_meta.MediaStorageSOPClassUID = ds.SOPClassUID
+        ds.file_meta.MediaStorageSOPInstanceUID = ds.SOPInstanceUID
+        ds.file_meta.TransferSyntaxUID = '1.2.840.10008.1.2.1'  # Explicit VR Little Endian
+        ds.is_little_endian = True
+        ds.is_implicit_VR = False
 
-        if archive is not None:
-            # Hands the Dataset to the serializer pool — main thread
-            # returns immediately, pydicom save_as runs on worker thread.
-            archive.add_dicom(fname, ds)
-        else:
-            ds.save_as(fname)
+        ds.save_as(fname)
 
     return dict(study_uid=study_uid, series_uid=series_uid,
                 frame_uid=frame_uid, sop_uids=sop_uids)
@@ -984,19 +547,17 @@ _ROI_COLORS = {
 def create_rtstruct(output_path, roi_list, gt_label_volume,
                     ct_series_uids, pixel_spacing=(1.0, 1.0),
                     slice_thickness=1.0, patient_id='DEBISim',
-                    recon_volume=None, archive=None):
+                    recon_volume=None):
     """
     Create a DICOM RT-Structure Set file with ROI contours for threats.
 
-    :param output_path:      path for the output .dcm file (or archive arcname)
+    :param output_path:      path for the output .dcm file
     :param roi_list:         list of dicts with keys: label, name, category, material
     :param gt_label_volume:  3D numpy int array (H x W x D) with object labels
     :param ct_series_uids:   dict from save_dicom_series (study_uid, series_uid, frame_uid, sop_uids)
     :param pixel_spacing:    (row_spacing, col_spacing) in mm
     :param slice_thickness:  slice thickness in mm
     :param patient_id:       DICOM PatientID
-    :param archive:          optional MonolithicArchive — when set, output is
-                             dispatched via archive.add_raw() instead of disk
     """
     import datetime
     from pydicom.dataset import Dataset, FileDataset
@@ -1140,19 +701,14 @@ def create_rtstruct(output_path, roi_list, gt_label_volume,
     ds.is_little_endian = True
     ds.is_implicit_VR = False
 
-    if archive is not None:
-        buf = io.BytesIO()
-        ds.save_as(buf)
-        archive.add_raw(output_path, buf.getvalue())
-    else:
-        ds.save_as(output_path)
+    ds.save_as(output_path)
 # -----------------------------------------------------------------------------
 
 
 def save_dicom_output(image_dir, recon_images, gt_label_volume,
                       sf_obj_list, pixel_spacing=(1.0, 1.0),
                       slice_thickness=1.0, scan_metadata=None,
-                      mu_handler=None, archive=None):
+                      mu_handler=None):
     """
     High-level function: save DICOM CT series + RT-Struct with ROIs for all
     objects (threats and non-threats alike).
@@ -1165,25 +721,14 @@ def save_dicom_output(image_dir, recon_images, gt_label_volume,
     :param slice_thickness:  slice thickness in mm
     :param scan_metadata:    dict of scanner/source parameters for DICOM tags
     :param mu_handler:       MuDatabaseHandler instance for material property lookups
-    :param archive:          optional MonolithicArchive — when set, all DICOM
-                             output is serialized to bytes and dispatched via
-                             archive.add_raw() instead of writing to disk
     """
-    # When archiving, use forward-slash joins for arcnames (not os.path.join
-    # which produces backslashes on Windows).
-    if archive is not None:
-        _join = lambda *parts: '/'.join(parts)
-    else:
-        _join = os.path.join
-
-    dicom_dir = _join(image_dir, 'dicom')
-    if archive is None:
-        os.makedirs(dicom_dir, exist_ok=True)
+    dicom_dir = os.path.join(image_dir, 'dicom')
+    os.makedirs(dicom_dir, exist_ok=True)
 
     # Save each recon image as a DICOM CT series
     ct_uids = None
     for idx, (name, volume) in enumerate(recon_images.items(), start=1):
-        series_dir = _join(dicom_dir, f'series_{name}')
+        series_dir = os.path.join(dicom_dir, f'series_{name}')
         # Per-series metadata: override kVp from series name if it has kV
         series_meta = dict(scan_metadata) if scan_metadata else {}
         import re
@@ -1194,7 +739,7 @@ def save_dicom_output(image_dir, recon_images, gt_label_volume,
             series_dir, volume,
             series_description=name, series_number=idx,
             pixel_spacing=pixel_spacing, slice_thickness=slice_thickness,
-            scan_metadata=series_meta, archive=archive
+            scan_metadata=series_meta
         )
         if ct_uids is None:
             ct_uids = uids  # use first series as reference for RT-Struct
@@ -1243,34 +788,26 @@ def save_dicom_output(image_dir, recon_images, gt_label_volume,
         ))
 
     if len(roi_list) > 0:
-        rtstruct_path = _join(dicom_dir, 'rtstruct.dcm')
+        rtstruct_path = os.path.join(dicom_dir, 'rtstruct.dcm')
         # Use the first recon volume to clip contours to valid FBP slices
         ref_recon = next(iter(recon_images.values()), None)
         create_rtstruct(
             rtstruct_path, roi_list, gt_label_volume,
             ct_uids, pixel_spacing=pixel_spacing,
             slice_thickness=slice_thickness,
-            recon_volume=ref_recon, archive=archive,
+            recon_volume=ref_recon,
         )
 
         # Save a human-readable ROI manifest (CSV) alongside the DICOM files
         import csv
-        manifest_path = _join(dicom_dir, 'roi_manifest.csv')
+        manifest_path = os.path.join(dicom_dir, 'roi_manifest.csv')
         fieldnames = ['label', 'name', 'category', 'material', 'threat',
                       'mu', 'z_eff', 'density']
-        if archive is not None:
-            buf = io.StringIO()
-            writer = csv.DictWriter(buf, fieldnames=fieldnames)
+        with open(manifest_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for roi in roi_list:
                 writer.writerow(roi)
-            archive.add_raw(manifest_path, buf.getvalue().encode('utf-8'))
-        else:
-            with open(manifest_path, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                for roi in roi_list:
-                    writer.writerow(roi)
 # -----------------------------------------------------------------------------
 
 
@@ -1305,4 +842,26 @@ def create_pil_collage(images, fpath, layout=None, vlims=None):
 # -------------------------------------------------------------------------
 
 
+def create_gif(fname, input_vol, stride=1, scale=None):
+    """
+
+    :param fname:
+    :param input_vol:
+    :param stride:
+    :return:
+    """
+
+    input_vol = (input_vol-input_vol.min())/(input_vol.max()-input_vol.min())
+    input_vol = (input_vol*255).astype(uint8)
+
+    if scale is None:
+        imageio.mimsave(fname,
+                        [input_vol[:,:, z]
+                         for z in range(0,input_vol.shape[2], stride)],
+                        fps=5)
+    else:
+        imageio.mimsave(fname,
+                        [rescale(input_vol[:,:, z], scale=scale, preserve_range=True)
+                         for z in range(0,input_vol.shape[2], stride)],
+                        fps=5)
 

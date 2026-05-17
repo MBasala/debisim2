@@ -148,7 +148,7 @@ class TestPipelineInit:
             xray_source_model=mock_xray_source,
             mu_handler=mock_mu_handler,
         )
-        for subdir in ['images', 'projections', 'ground_truth']:
+        for subdir in ['images', 'projections', 'ground_truth', 'gifs']:
             assert os.path.isdir(os.path.join(sim_path, subdir))
 
     def test_init_stores_scanner_geometry(self, tmp_path, mock_scanner,
