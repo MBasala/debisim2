@@ -999,13 +999,16 @@ class BaggageImage3D(object):
         self.ws_bag     = v_bag     # virtual bag wherein objects are placed
 
         # final bag as output - use this for further processing
-        # full_bag_img is (gantry_dia, gantry_dia) which may differ from
-        # img_vol when pixel_size != 1mm.  Crop/pad to match img_vol[:2].
+        # full_bag_img and gantry_cavity are (gantry_dia, gantry_dia) which
+        # may differ from img_vol when pixel_size != 1mm.  Resize to match.
         fbg = full_bag_img
         if fbg.shape[0] != self.img_vol[0] or fbg.shape[1] != self.img_vol[1]:
             from skimage.transform import resize
             fbg = resize(fbg, (self.img_vol[0], self.img_vol[1]),
                          order=0, preserve_range=True, anti_aliasing=False)
+            self.gantry_cavity = resize(
+                self.gantry_cavity, (self.img_vol[0], self.img_vol[1]),
+                order=0, preserve_range=True, anti_aliasing=False)
         self.virtual_bag = fbg[:, :, newaxis] * np.ones(self.img_vol)
 
         if logfile is None: logfile = os.path.join(sim_dir, 

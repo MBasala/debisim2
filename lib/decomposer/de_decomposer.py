@@ -246,7 +246,7 @@ class DEDecomposer(object):
         self.photoelectric = photoelectric
 
         self._load_spectra()
-        self.opt_specs = dict()
+        self.opt_specs = {}
 
         # Prepare Radon transpose, sparse row for efficient dot product
         if projector == 'cpu':
@@ -292,15 +292,15 @@ class DEDecomposer(object):
         self.R = R
         self.projector = projector
 
-        self.dect_specs = dict(
-            spctr_h_fname=spctr_h_fname,
-            spctr_l_fname=spctr_l_fname,
-            nangs=self.nangs,
-            nbins=self.nbins,
-            photon_count_low=self.photon_count_low,
-            photon_count_high=self.photon_count_high,
-            projector=projector,
-        )
+        self.dect_specs = {
+            'spctr_h_fname': spctr_h_fname,
+            'spctr_l_fname': spctr_l_fname,
+            'nangs': self.nangs,
+            'nbins': self.nbins,
+            'photon_count_low': self.photon_count_low,
+            'photon_count_high': self.photon_count_high,
+            'projector': projector,
+        }
         self.view_dect_specs()
 
         self.m1_cp = None
@@ -341,6 +341,9 @@ class DEDecomposer(object):
         self.spctrm_l_kn = array(self.spctrm_l)
         self.spctrm_l_kn[:, 1] = self.spctrm_l_kn[:, 1] * self.klein_nishina(
             self.spctrm_l[:, 0])
+
+        # Invalidate GPU tensor cache so it's rebuilt with new bases
+        self._gpu_cache = None
     # -------------------------------------------------------------------------
 
     def _effective_atomic_number(self, img_p, img_c):
@@ -423,7 +426,7 @@ class DEDecomposer(object):
         ---------------------------------------------------------------------
         """
 
-        if cp == None:
+        if cp is None:
             cp = [(0.3, 10000), (0.6, 20000), (0.9, 30000)]
 
         # Draw a circle
@@ -677,28 +680,63 @@ class DEDecomposer(object):
 
         # Calculate projection values, using GPU whenever possible
         if self.projector == 'gpu' and useGPU:
-            t_spctrm_h_kn = torch.from_numpy(
-                self.klein_nishina(spctrm_h[:, 0])).type(torch.cuda.FloatTensor)
-            t_spctrm_l_kn = torch.from_numpy(
-                self.klein_nishina(spctrm_l[:, 0])).type(torch.cuda.FloatTensor)
-            t_spctrm_h_p = torch.from_numpy(
-                self.photoelectric(spctrm_h[:, 0])).type(torch.cuda.FloatTensor)
-            t_spctrm_l_p = torch.from_numpy(
-                self.photoelectric(spctrm_l[:, 0])).type(torch.cuda.FloatTensor)
-            t_spctrm_h = torch.from_numpy(spctrm_h[:, 1]).type(
-                torch.cuda.FloatTensor)
-            t_spctrm_l = torch.from_numpy(spctrm_l[:, 1]).type(
-                torch.cuda.FloatTensor)
-            t_A_c = torch.from_numpy(A_c).type(torch.cuda.FloatTensor)
-            t_A_p = torch.from_numpy(A_p).type(torch.cuda.FloatTensor)
+            # Cache constant spectrum tensors on GPU to avoid repeated
+            # CPU→GPU transfers (spectra don't change between calls).
+            if not hasattr(self, '_gpu_cache') or self._gpu_cache is None:
+                self._gpu_cache = dict(
+                    spctrm_h_kn=torch.from_numpy(
+                        self.klein_nishina(self.spctrm_h[:, 0])
+                    ).cuda().float(),
+                    spctrm_l_kn=torch.from_numpy(
+                        self.klein_nishina(self.spctrm_l[:, 0])
+                    ).cuda().float(),
+                    spctrm_h_p=torch.from_numpy(
+                        self.photoelectric(self.spctrm_h[:, 0])
+                    ).cuda().float(),
+                    spctrm_l_p=torch.from_numpy(
+                        self.photoelectric(self.spctrm_l[:, 0])
+                    ).cuda().float(),
+                    spctrm_h=torch.from_numpy(
+                        self.spctrm_h[:, 1]).cuda().float(),
+                    spctrm_l=torch.from_numpy(
+                        self.spctrm_l[:, 1]).cuda().float(),
+                )
+
+            # Use custom spectra if provided, otherwise cached defaults
+            if spctrm_h is not self.spctrm_h:
+                t_spctrm_h_kn = torch.from_numpy(
+                    self.klein_nishina(spctrm_h[:, 0])).cuda().float()
+                t_spctrm_h_p = torch.from_numpy(
+                    self.photoelectric(spctrm_h[:, 0])).cuda().float()
+                t_spctrm_h = torch.from_numpy(
+                    spctrm_h[:, 1]).cuda().float()
+            else:
+                t_spctrm_h_kn = self._gpu_cache['spctrm_h_kn']
+                t_spctrm_h_p = self._gpu_cache['spctrm_h_p']
+                t_spctrm_h = self._gpu_cache['spctrm_h']
+
+            if spctrm_l is not self.spctrm_l:
+                t_spctrm_l_kn = torch.from_numpy(
+                    self.klein_nishina(spctrm_l[:, 0])).cuda().float()
+                t_spctrm_l_p = torch.from_numpy(
+                    self.photoelectric(spctrm_l[:, 0])).cuda().float()
+                t_spctrm_l = torch.from_numpy(
+                    spctrm_l[:, 1]).cuda().float()
+            else:
+                t_spctrm_l_kn = self._gpu_cache['spctrm_l_kn']
+                t_spctrm_l_p = self._gpu_cache['spctrm_l_p']
+                t_spctrm_l = self._gpu_cache['spctrm_l']
+
+            t_A_c = torch.from_numpy(A_c).cuda().float()
+            t_A_p = torch.from_numpy(A_p).cuda().float()
             t_A_h = -torch.ger(t_A_c, t_spctrm_h_kn) - torch.ger(t_A_p,
                                                                  t_spctrm_h_p)
             t_A_l = -torch.ger(t_A_c, t_spctrm_l_kn) - torch.ger(t_A_p,
                                                                  t_spctrm_l_p)
             t_A_h = torch.matmul(torch.exp(t_A_h), t_spctrm_h)
             t_A_l = torch.matmul(torch.exp(t_A_l), t_spctrm_l)
-            A_h = t_A_h.to('cpu').numpy()
-            A_l = t_A_l.to('cpu').numpy()
+            A_h = t_A_h.cpu().numpy()
+            A_l = t_A_l.cpu().numpy()
 
         else:
             A_l = -outer(A_c, self.klein_nishina(spctrm_l[:, 0])) - \
