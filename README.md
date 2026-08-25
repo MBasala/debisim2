@@ -2,7 +2,7 @@
 >
 > **This script and most of its documentation were written with the help of
 > Claude (Anthropic's LLM).** While I've stress-tested it on real hardware and
-> every bug we hit during that test is now fixed in the script, please
+> every bug we hit during that test is now fixed in the code base, please
 > understand the implications:
 > * 90% of code is vibe coded.
 > * I have been doing some manual reviews.
