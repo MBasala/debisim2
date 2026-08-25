@@ -1,3 +1,13 @@
+> ## ⚠️ AI Slop Disclaimer
+>
+> **This script and most of its documentation were written with the help of
+> Claude (Anthropic's LLM).** While I've stress-tested it on real hardware and
+> every bug we hit during that test is now fixed in the script, please
+> understand the implications:
+> * 90% of code is vibe coded.
+> * I have been doing some manual reviews.
+> * Seems to be more functional then forked DEBSim2.0, but would not trust it for real world work.
+
 ### DEBISim2.0 - A Simulation Pipeline for Dual Energy CT-based Baggage Inspection Systems
 
 DEBISim (Dual Energy Baggage Image Simulator) is a Python-based 3D CT Simulation library for Single and Dual energy X-ray image data generation. This library is designed to aid in the development, testing and evaluation of Single and Dual Energy CT based target detection systems for airport baggage screening and other CT imaging applications requiring anomaly detection. 
