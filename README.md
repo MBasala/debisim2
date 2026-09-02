@@ -1,6 +1,6 @@
 > ## ⚠️ AI Slop Disclaimer
 >
-> **This script and most of its documentation were written with the help of
+> **This fork and most of its documentation were written with the help of
 > Claude (Anthropic's LLM).** While I've stress-tested it on real hardware and
 > every bug we hit during that test is now fixed in the code base, please
 > understand the implications:
